@@ -510,6 +510,60 @@ def ratio_timeseries(income, balance, cashflow):
     return out
 
 
+def extra_ratio_timeseries(income, balance, cashflow):
+    """
+    Additional high-signal ratios as per-year series, aligned across fiscal
+    years. Returns an ordered list of {name, series, unit, desc}. A ratio whose
+    source line items are unavailable (missing rows, None, or no overlapping
+    years) is simply omitted, so callers can render whatever is present.
+    """
+    def series_of(df, *items):
+        if df is None:
+            return pd.Series(dtype=float)
+        for it in items:
+            if it in df.index:
+                s = clean_series(df, it)
+                if len(s):
+                    return s
+        return pd.Series(dtype=float)
+
+    def ratio(num, den, scale=1.0):
+        if not len(num) or not len(den):
+            return pd.Series(dtype=float)
+        common = num.index.intersection(den.index)
+        if len(common) == 0:
+            return pd.Series(dtype=float)
+        d = den[common]
+        return (num[common] / d.where(d != 0) * scale).dropna()
+
+    ic = invested_capital(balance)
+    fcf = series_of(cashflow, "Free Cash Flow")
+    ebit = series_of(income, "Operating Income", "EBIT")
+    rev = series_of(income, "Revenue")
+    gross = series_of(income, "Gross Profit")
+    cur_assets = series_of(balance, "Total Current Assets")
+    cur_liab = series_of(balance, "Total Current Liabilities")
+    interest = series_of(income, "Interest Expense", "Interest Expense / Income")
+
+    out = []
+
+    def add(name, series, unit, desc):
+        if len(series) > 1:                      # need at least two years for a trend
+            out.append({"name": name, "series": series, "unit": unit, "desc": desc})
+
+    add("CROIC", ratio(fcf, ic, 100), "%",
+        "Free cash flow as a % of invested capital")
+    add("ROIC", ratio(ebit, ic, 100), "%",
+        "Operating income as a % of invested capital")
+    add("Current ratio", ratio(cur_assets, cur_liab), "x",
+        "Current assets vs current liabilities")
+    add("Interest coverage", ratio(ebit, interest), "x",
+        "Operating income vs interest expense")
+    add("Gross margin", ratio(gross, rev, 100), "%",
+        "Gross profit per dollar of sales")
+    return out
+
+
 def estimate_valuation(income, balance, cashflow, shares, price,
                        discount_rate, terminal_growth):
     """
@@ -767,6 +821,16 @@ def main():
                 st.plotly_chart(
                     line_chart(info["series"], f"{r['name']} over time", ylab),
                     use_container_width=True)
+
+        # Additional high-signal ratios as trend charts. Each renders only when
+        # its source line items are available; missing ones are skipped silently.
+        for r in extra_ratio_timeseries(income, balance, cashflow):
+            s = r["series"]
+            ylab = "%" if r["unit"] == "%" else "x"
+            st.metric(r["name"], f"{s.iloc[-1]:.2f}", help=r["desc"])
+            st.plotly_chart(
+                line_chart(s, f"{r['name']} over time", ylab),
+                use_container_width=True)
 
     # ---- Valuation --------------------------------------------------------
     with tabs[5]:
