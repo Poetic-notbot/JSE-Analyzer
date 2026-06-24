@@ -429,6 +429,54 @@ def compute_ratios(income, balance, cashflow):
     return ratios
 
 
+def ratio_timeseries(income, balance, cashflow):
+    """
+    Per-year values for each headline ratio, aligned across fiscal years.
+
+    Returns {name: {"series": Series, "unit": "%"|"x"}}. Mirrors the definitions
+    in compute_ratios so the trend charts agree with the latest-year numbers.
+    """
+    def series_of(df, *items):
+        if df is None:
+            return pd.Series(dtype=float)
+        for it in items:
+            if it in df.index:
+                s = clean_series(df, it)
+                if len(s):
+                    return s
+        return pd.Series(dtype=float)
+
+    def ratio(num, den, scale=1.0):
+        common = num.index.intersection(den.index)
+        if len(common) == 0:
+            return pd.Series(dtype=float)
+        d = den[common]
+        return (num[common] / d.where(d != 0) * scale).dropna()
+
+    rev = series_of(income, "Revenue")
+    ni = series_of(income, "Net Income", "Net Income Common")
+    ebit = series_of(income, "Operating Income", "EBIT")
+    assets = series_of(balance, "Total Assets")
+    equity = series_of(balance, "Shareholders' Equity", "Total Equity")
+    debt = series_of(balance, "Total Debt")
+    ocf = series_of(cashflow, "Operating Cash Flow")
+
+    out = {}
+
+    def add(name, series, unit):
+        if len(series):
+            out[name] = {"series": series, "unit": unit}
+
+    add("Net margin", ratio(ni, rev, 100), "%")
+    add("Operating margin", ratio(ebit, rev, 100), "%")
+    add("Return on assets", ratio(ni, assets, 100), "%")
+    add("Return on equity", ratio(ni, equity, 100), "%")
+    add("Asset turnover", ratio(rev, assets), "x")
+    add("Debt-to-equity", ratio(debt, equity), "x")
+    add("Cash conversion", ratio(ocf, ni), "x")
+    return out
+
+
 def estimate_valuation(income, balance, cashflow, shares, price,
                        discount_rate, terminal_growth):
     """
@@ -531,6 +579,14 @@ def share_chart(series, base, title):
     return fig
 
 
+def line_chart(series, title, ylab, color=NAVY):
+    fig = go.Figure(go.Scatter(x=list(series.index), y=list(series.values),
+                               mode="lines+markers", line=dict(color=color, width=3)))
+    fig.update_layout(title=title, xaxis_title="Fiscal year", yaxis_title=ylab,
+                      height=340, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # 4. USER INTERFACE
 # ---------------------------------------------------------------------------
@@ -580,19 +636,39 @@ def main():
         st.subheader(f"{companies.get(ticker, ticker)} — overview")
         st.write(f"Reporting currency: **{currency}**")
         col1, col2 = st.columns(2)
-        if income is not None and "Revenue" in income.index:
-            rev = clean_series(income, "Revenue")
-            col1.plotly_chart(bar_chart(rev, "Revenue", currency), use_container_width=True)
-        ni_name = "Net Income" if (income is not None and "Net Income" in income.index) else "Net Income Common"
-        if income is not None and ni_name in income.index:
-            ni = clean_series(income, ni_name)
-            col2.plotly_chart(bar_chart(ni, "Net income", currency, color=GREEN),
+
+        # Invested Capital usually lives on the balance sheet; fall back to the
+        # other statements just in case the data source files it elsewhere.
+        ic_df = None
+        for cand in (balance, income, cashflow):
+            if cand is not None and "Invested Capital" in cand.index:
+                ic_df = cand
+                break
+        if ic_df is not None:
+            ic = clean_series(ic_df, "Invested Capital")
+            col1.plotly_chart(bar_chart(ic, "Invested Capital", currency),
                               use_container_width=True)
+
+        if cashflow is not None and "Free Cash Flow" in cashflow.index:
+            fcf = clean_series(cashflow, "Free Cash Flow")
+            col2.plotly_chart(bar_chart(fcf, "Free Cash Flow", currency, color=GREEN),
+                              use_container_width=True)
+
         ratios = compute_ratios(income, balance, cashflow)
-        if ratios:
+        headline = list(ratios[:4])
+        # ROIC (Return on Invested Capital): textbook operating-based definition,
+        # Operating Income / Invested Capital.
+        op_name = "Operating Income" if (income is not None and "Operating Income" in income.index) else "EBIT"
+        op_s = clean_series(income, op_name) if income is not None else pd.Series(dtype=float)
+        ic_s = clean_series(ic_df, "Invested Capital") if ic_df is not None else pd.Series(dtype=float)
+        if len(op_s) and len(ic_s) and ic_s.iloc[-1]:
+            headline.append({"name": "ROIC",
+                             "value": op_s.iloc[-1] / ic_s.iloc[-1] * 100,
+                             "desc": "Operating income as a % of invested capital"})
+        if headline:
             st.markdown("**Key ratios (latest year)**")
-            cols = st.columns(min(4, len(ratios)))
-            for i, r in enumerate(ratios[:4]):
+            cols = st.columns(min(5, len(headline)))
+            for i, r in enumerate(headline[:5]):
                 cols[i].metric(r["name"], f"{r['value']:.1f}")
 
     # ---- One drill-down tab per statement --------------------------------
@@ -636,8 +712,15 @@ def main():
         ratios = compute_ratios(income, balance, cashflow)
         if not ratios:
             st.info("Not enough data to compute ratios for this company.")
+        series_by_name = ratio_timeseries(income, balance, cashflow)
         for r in ratios:
             st.metric(r["name"], f"{r['value']:.2f}", help=r["desc"])
+            info = series_by_name.get(r["name"])
+            if info is not None and len(info["series"]) > 1:
+                ylab = "%" if info["unit"] == "%" else "Ratio (×)"
+                st.plotly_chart(
+                    line_chart(info["series"], f"{r['name']} over time", ylab),
+                    use_container_width=True)
 
     # ---- Valuation --------------------------------------------------------
     with tabs[5]:
