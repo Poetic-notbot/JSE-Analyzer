@@ -390,6 +390,39 @@ def build_narrative(df, item, statement, aggregates, currency):
     return "\n\n".join(lines)
 
 
+def invested_capital(balance):
+    """
+    Invested Capital per fiscal year, computed (it is not a line item in the
+    data feed) using the excluding-cash definition:
+
+        Total Debt + Total Equity - Cash & Equivalents
+
+    The equity term prefers 'Total Common Equity' and falls back to
+    "Shareholders' Equity". The three rows are aligned on the fiscal years they
+    have in common; an empty Series is returned if any required row is missing.
+    """
+    if balance is None:
+        return pd.Series(dtype=float)
+
+    def row(*items):
+        for it in items:
+            if it in balance.index:
+                s = clean_series(balance, it)
+                if len(s):
+                    return s
+        return pd.Series(dtype=float)
+
+    debt = row("Total Debt")
+    equity = row("Total Common Equity", "Shareholders' Equity")
+    cash = row("Cash & Equivalents", "Cash & Cash Equivalents")
+    if not len(debt) or not len(equity) or not len(cash):
+        return pd.Series(dtype=float)
+    common = debt.index.intersection(equity.index).intersection(cash.index)
+    if len(common) == 0:
+        return pd.Series(dtype=float)
+    return (debt[common] + equity[common] - cash[common]).dropna()
+
+
 def compute_ratios(income, balance, cashflow):
     """A compact set of decision-useful ratios for the latest common year."""
     ratios = []
@@ -637,16 +670,11 @@ def main():
         st.write(f"Reporting currency: **{currency}**")
         col1, col2 = st.columns(2)
 
-        # Invested Capital usually lives on the balance sheet; fall back to the
-        # other statements just in case the data source files it elsewhere.
-        ic_df = None
-        for cand in (balance, income, cashflow):
-            if cand is not None and "Invested Capital" in cand.index:
-                ic_df = cand
-                break
-        if ic_df is not None:
-            ic = clean_series(ic_df, "Invested Capital")
-            col1.plotly_chart(bar_chart(ic, "Invested Capital", currency),
+        # Invested Capital is not provided as a line item, so compute it:
+        # Total Debt + Total Equity - Cash & Equivalents.
+        ic_s = invested_capital(balance)
+        if len(ic_s):
+            col1.plotly_chart(bar_chart(ic_s, "Invested Capital", currency),
                               use_container_width=True)
 
         if cashflow is not None and "Free Cash Flow" in cashflow.index:
@@ -656,11 +684,10 @@ def main():
 
         ratios = compute_ratios(income, balance, cashflow)
         headline = list(ratios[:4])
-        # ROIC (Return on Invested Capital): textbook operating-based definition,
+        # ROIC (Return on Invested Capital): operating-based definition,
         # Operating Income / Invested Capital.
         op_name = "Operating Income" if (income is not None and "Operating Income" in income.index) else "EBIT"
         op_s = clean_series(income, op_name) if income is not None else pd.Series(dtype=float)
-        ic_s = clean_series(ic_df, "Invested Capital") if ic_df is not None else pd.Series(dtype=float)
         if len(op_s) and len(ic_s) and ic_s.iloc[-1]:
             headline.append({"name": "ROIC",
                              "value": op_s.iloc[-1] / ic_s.iloc[-1] * 100,
