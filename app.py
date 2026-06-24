@@ -679,8 +679,22 @@ def main():
 
         if cashflow is not None and "Free Cash Flow" in cashflow.index:
             fcf = clean_series(cashflow, "Free Cash Flow")
+        else:
+            fcf = pd.Series(dtype=float)
+        if len(fcf):
             col2.plotly_chart(bar_chart(fcf, "Free Cash Flow", currency, color=GREEN),
                               use_container_width=True)
+
+        # CROIC trend (full width, under the two charts above):
+        # Free Cash Flow / Invested Capital per fiscal year, on common years.
+        if len(fcf) and len(ic_s):
+            common = fcf.index.intersection(ic_s.index)
+            denom = ic_s[common]
+            croic = (fcf[common] / denom.where(denom != 0) * 100).dropna()
+            if len(croic) > 1:
+                st.plotly_chart(
+                    line_chart(croic, "CROIC (FCF / Invested Capital)", "%"),
+                    use_container_width=True)
 
         ratios = compute_ratios(income, balance, cashflow)
         headline = list(ratios[:4])
@@ -694,9 +708,14 @@ def main():
                              "desc": "Operating income as a % of invested capital"})
         if headline:
             st.markdown("**Key ratios (latest year)**")
+            # Short labels so all five fit on one row; full name kept in tooltip.
+            abbrev = {"Net margin": "NM", "Operating margin": "OM",
+                      "Return on assets": "ROA", "Return on equity": "ROE",
+                      "ROIC": "ROIC"}
             cols = st.columns(min(5, len(headline)))
             for i, r in enumerate(headline[:5]):
-                cols[i].metric(r["name"], f"{r['value']:.1f}")
+                cols[i].metric(abbrev.get(r["name"], r["name"]), f"{r['value']:.1f}",
+                               help=f"{r['name']} — {r.get('desc', '')}")
 
     # ---- One drill-down tab per statement --------------------------------
     statement_tabs = {
