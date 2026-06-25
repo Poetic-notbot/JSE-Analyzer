@@ -339,6 +339,21 @@ def fmt_money(value, currency="JMD"):
     return f"{sign}{currency} {v:,.0f}"
 
 
+def fmt_money_compact(value, currency="JMD"):
+    """Like fmt_money but tuned to fit in a narrow metric card: keeps the
+    B/M/K abbreviation, drops unnecessary decimals (so 6.10B -> '6.1B',
+    43.0 -> '43')."""
+    if value is None or pd.isna(value):
+        return "n/a"
+    sign = "-" if value < 0 else ""
+    v = abs(value)
+    for unit, label in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if v >= unit:
+            num = f"{v / unit:.1f}".rstrip("0").rstrip(".")
+            return f"{sign}{currency} {num}{label}"
+    return f"{sign}{currency} {v:,.0f}"
+
+
 def build_narrative(df, item, statement, aggregates, currency):
     """Plain-language read of how an item changed and what drove it."""
     s = clean_series(df, item)
@@ -564,17 +579,32 @@ def extra_ratio_timeseries(income, balance, cashflow):
     return out
 
 
-# Candidate parent (composite) metrics to offer for decomposition, per
-# statement. These are structural row-name candidates only; whether a given
-# ticker actually exposes one — and what its components are — is determined at
-# runtime from the feed's own ordering and subtotal flags.
-DECOMP_PARENTS = {
-    "Income Statement": ["Revenue", "Operating Expenses", "Net Income"],
-    "Balance Sheet": ["Total Assets", "Total Current Assets", "Total Liabilities",
-                      "Total Current Liabilities", "Total Debt",
-                      "Shareholders' Equity", "Total Equity"],
-    "Cash Flow": ["Operating Cash Flow", "Investing Cash Flow",
-                  "Financing Cash Flow", "Net Cash Flow"],
+# Well-known additive subtotal row NAMES per statement (structural identifiers,
+# not values). Used only to RECOGNISE subtotals the feed may not have flagged;
+# the actual parents offered for a ticker are still taken from that statement's
+# own dataframe (a name here that the ticker doesn't report is ignored).
+KNOWN_SUBTOTALS = {
+    "Income Statement": [
+        "Revenue", "Total Revenue", "Gross Profit",
+        "Operating Income", "Operating Profit", "Operating Expenses",
+        "Total Operating Expenses", "Pretax Income", "Pre-Tax Income",
+        "Net Income", "Net Income Common",
+        # financial-sector subtotals
+        "Net Interest Income", "Total Interest Income", "Total Interest Expense",
+        "Revenue After Provisions", "Net Revenue After Provisions",
+        "Net Premiums Earned", "Total Premiums Earned",
+    ],
+    "Balance Sheet": [
+        "Total Assets", "Total Current Assets", "Total Non-Current Assets",
+        "Total Liabilities", "Total Current Liabilities",
+        "Total Non-Current Liabilities", "Total Equity", "Shareholders' Equity",
+        "Total Common Equity", "Total Liabilities & Equity",
+        "Total Liabilities and Equity",
+    ],
+    "Cash Flow": [
+        "Operating Cash Flow", "Investing Cash Flow", "Financing Cash Flow",
+        "Net Cash Flow", "Net Change in Cash",
+    ],
 }
 
 
@@ -605,6 +635,27 @@ def decomposition_children(df, parent, aggregates):
             children.append(name)
             i -= 1
     return list(reversed(children))
+
+
+def decomposable_parents(df, aggregates, statement):
+    """
+    Parent metrics offered for decomposition, sourced ONLY from THIS statement's
+    own dataframe. A row qualifies if it is a subtotal — either flagged by the
+    feed (`aggregates`) or a well-known additive subtotal name for `statement`
+    that the ticker actually reports — and it has >=2 decomposable components.
+
+    Returns (parents_in_statement_order, effective_aggregates). The effective
+    aggregates (feed flags unioned with recognised subtotal names present in the
+    data) are returned so the caller decomposes children against the same set.
+    """
+    if df is None:
+        return [], set()
+    known = {n for n in KNOWN_SUBTOTALS.get(statement, []) if n in df.index}
+    eff_aggs = set(aggregates) | known
+    parents = [name for name in df.index                       # statement order
+               if name in eff_aggs
+               and len(decomposition_children(df, name, eff_aggs)) >= 2]
+    return parents, eff_aggs
 
 
 def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
@@ -1052,30 +1103,31 @@ def main():
         else:
             sname = st.selectbox("Statement", list(avail.keys()), key="decomp_stmt")
             ddf, daggs = avail[sname]
-            parents = [p for p in DECOMP_PARENTS.get(sname, [])
-                       if p in ddf.index and p in daggs
-                       and len(decomposition_children(ddf, p, daggs)) >= 2]
+            # Parents come from THIS statement's own dataframe (per-statement key
+            # so switching statements never carries stale options/selection).
+            parents, eff_aggs = decomposable_parents(ddf, daggs, sname)
             if not parents:
                 st.info(f"No decomposable parent metrics with components were found in "
                         f"the {sname} for this company.")
             else:
-                parent = st.selectbox("Parent metric", parents, key="decomp_parent")
-                d = decompose(ddf, parent, daggs)
+                parent = st.selectbox("Parent metric", parents,
+                                      key=f"decomp_parent::{sname}")
+                d = decompose(ddf, parent, eff_aggs)
                 if d is None:
                     st.info("Not enough years of data to decompose this metric.")
                 else:
                     m1, m2, m3 = st.columns(3)
-                    m1.metric(f"{parent} change ({d['span']})",
-                              fmt_money(d["parent_delta"], currency))
-                    m2.metric("Explained by components", fmt_money(d["explained"], currency),
+                    m1.metric("Total change", fmt_money_compact(d["parent_delta"], currency),
+                              help=f"{parent} change over {d['span']}")
+                    m2.metric("Explained", fmt_money_compact(d["explained"], currency),
                               help="Sum of component changes that have both endpoints")
-                    m3.metric("Other / unexplained", fmt_money(d["unexplained"], currency),
+                    m3.metric("Unexplained", fmt_money_compact(d["unexplained"], currency),
                               help="Parent change minus identified component changes")
                     if d["driver"] and d["driver"]["delta"] is not None:
                         drv = d["driver"]
                         sign = "+" if drv["delta"] >= 0 else "−"
                         st.markdown(f"**Biggest driver:** {drv['name']} "
-                                    f"({sign}{fmt_money(abs(drv['delta']), currency)})")
+                                    f"({sign}{fmt_money_compact(abs(drv['delta']), currency)})")
 
                     st.plotly_chart(
                         waterfall_chart(d, f"{parent}: contribution to change", currency),
@@ -1092,9 +1144,9 @@ def main():
                     for c in d["components"]:
                         table.append({
                             "Component": c["name"],
-                            "First": fmt_money(c["first"], currency) if c["first"] is not None else "n/a",
-                            "Last": fmt_money(c["last"], currency) if c["last"] is not None else "n/a",
-                            "Change": fmt_money(c["delta"], currency) if c["delta"] is not None else "n/a",
+                            "First": fmt_money_compact(c["first"], currency) if c["first"] is not None else "n/a",
+                            "Last": fmt_money_compact(c["last"], currency) if c["last"] is not None else "n/a",
+                            "Change": fmt_money_compact(c["delta"], currency) if c["delta"] is not None else "n/a",
                             "CAGR": f"{c['cagr'] * 100:.1f}%" if c["cagr"] is not None else "n/a",
                             "% of parent change": f"{c['contrib_pct']:.1f}%" if c["contrib_pct"] is not None else "n/a",
                         })
