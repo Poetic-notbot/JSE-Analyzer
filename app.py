@@ -564,6 +564,168 @@ def extra_ratio_timeseries(income, balance, cashflow):
     return out
 
 
+# Candidate parent (composite) metrics to offer for decomposition, per
+# statement. These are structural row-name candidates only; whether a given
+# ticker actually exposes one — and what its components are — is determined at
+# runtime from the feed's own ordering and subtotal flags.
+DECOMP_PARENTS = {
+    "Income Statement": ["Revenue", "Operating Expenses", "Net Income"],
+    "Balance Sheet": ["Total Assets", "Total Current Assets", "Total Liabilities",
+                      "Total Current Liabilities", "Total Debt",
+                      "Shareholders' Equity", "Total Equity"],
+    "Cash Flow": ["Operating Cash Flow", "Investing Cash Flow",
+                  "Financing Cash Flow", "Net Cash Flow"],
+}
+
+
+def decomposition_children(df, parent, aggregates):
+    """
+    Components of a parent subtotal, derived from the statement's own ordering
+    and the `aggregates` set (an extension of components_of that handles nested
+    subtotals). Walking upward from the parent: a raw row is a component; a
+    nested subtotal counts as ONE component and its own sub-block is skipped, so
+    the returned components partition the parent. Returns names in statement
+    order (top -> bottom).
+    """
+    if df is None or parent not in df.index:
+        return []
+    order = list(df.index)
+    idx = order.index(parent)
+    children = []
+    i = idx - 1
+    while i >= 0:
+        name = order[i]
+        if name in aggregates:
+            children.append(name)                # nested subtotal as one block
+            j = i - 1
+            while j >= 0 and order[j] not in aggregates:
+                j -= 1                            # skip the rows it rolls up
+            i = j
+        else:
+            children.append(name)
+            i -= 1
+    return list(reversed(children))
+
+
+def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
+    """
+    Decompose a parent subtotal's change over its full available window into
+    component contributions, using only the company's reported data.
+
+    Significance is gated on the LARGER of |parent change| and the gross
+    component movement (sum of |component change|), so large offsetting
+    components that net near zero still surface instead of collapsing into
+    'Other'. Returns a dict, or None if the parent lacks two years of data.
+    """
+    if df is None or parent not in df.index:
+        return None
+    p = clean_series(df, parent)
+    if len(p) < 2:
+        return None
+    y0, yN = p.index[0], p.index[-1]
+    p0, pN = float(p.iloc[0]), float(p.iloc[-1])
+    parent_delta = pN - p0
+
+    components = []
+    for name in decomposition_children(df, parent, aggregates):
+        cs = clean_series(df, name)
+        first = float(cs[y0]) if y0 in cs.index else None
+        last = float(cs[yN]) if yN in cs.index else None
+        delta = (last - first) if (first is not None and last is not None) else None
+        contrib = (delta / parent_delta * 100) if (delta is not None and parent_delta) else None
+        share0 = (first / p0 * 100) if (first is not None and p0) else None
+        shareN = (last / pN * 100) if (last is not None and pN) else None
+        components.append({"name": name, "first": first, "last": last, "delta": delta,
+                           "cagr": cagr(cs), "contrib_pct": contrib,
+                           "share0": share0, "shareN": shareN})
+
+    deltas = [c["delta"] for c in components if c["delta"] is not None]
+    explained = sum(deltas)
+    unexplained = parent_delta - explained
+    gross = sum(abs(x) for x in deltas)
+    threshold = sig_frac * max(abs(parent_delta), gross)
+
+    significant = [c for c in components
+                   if c["delta"] is not None and threshold > 0
+                   and abs(c["delta"]) >= threshold]
+    # Cap the number of waterfall bars for readability; any dropped components
+    # fold into 'Other / unexplained' automatically (it balances to the total).
+    if len(significant) > max_bars:
+        keep = sorted(significant, key=lambda c: abs(c["delta"]), reverse=True)[:max_bars]
+        kept = {id(c) for c in keep}
+        significant = [c for c in significant if id(c) in kept]
+
+    best = None
+    for c in components:
+        if c["delta"] is None:
+            continue
+        if best is None or abs(c["delta"]) > abs(best["delta"]):
+            best = c
+    driver = None
+    if best is not None:
+        driver = {"name": best["name"], "delta": best["delta"],
+                  "pct": pct_change_total(clean_series(df, best["name"]))}
+
+    leader = None
+    for c in components:
+        if c["share0"] is None or c["shareN"] is None:
+            continue
+        shift = abs(c["shareN"] - c["share0"])
+        if leader is None or shift > leader["_shift"]:
+            leader = {"name": c["name"], "from_pct": c["share0"],
+                      "to_pct": c["shareN"], "_shift": shift}
+    mix_shift_leader = ({"name": leader["name"], "from_pct": leader["from_pct"],
+                         "to_pct": leader["to_pct"]} if leader else None)
+
+    return {"parent": parent, "year0": y0, "yearN": yN, "span": f"{y0}–{yN}",
+            "p0": p0, "pN": pN, "parent_delta": parent_delta,
+            "parent_cagr": cagr(p), "parent_pct": pct_change_total(p),
+            "components": components, "significant": significant,
+            "explained": explained, "unexplained": unexplained,
+            "driver": driver, "mix_shift_leader": mix_shift_leader}
+
+
+def decomposition_narrative(d, currency):
+    """A grounded 2-4 sentence read of a decomposition, from the data only."""
+    if d is None or d["parent_delta"] is None:
+        return "Not enough data to decompose this metric."
+    p = d["parent"]
+    pd_delta = d["parent_delta"]
+    direction = "rose" if pd_delta > 0 else ("fell" if pd_delta < 0 else "was roughly flat")
+    pct_txt = f" ({abs(d['parent_pct']):.1f}%)" if d["parent_pct"] is not None else ""
+    cagr_txt = (f", about {d['parent_cagr'] * 100:.1f}% a year"
+                if d["parent_cagr"] is not None else "")
+    lines = [
+        f"**{p}** {direction} by {fmt_money(abs(pd_delta), currency)}{pct_txt} over "
+        f"{d['span']} ({fmt_money(d['p0'], currency)} → {fmt_money(d['pN'], currency)}){cagr_txt}."
+    ]
+    drv = d["driver"]
+    if drv and drv["delta"] is not None:
+        moved = "rose" if drv["delta"] > 0 else "fell"
+        dpct = f" ({abs(drv['pct']):.1f}%)" if drv["pct"] is not None else ""
+        share = (f", about {abs(drv['delta'] / pd_delta * 100):.0f}% of the net change"
+                 if pd_delta else "")
+        lines.append(f"The single biggest driver was **{drv['name']}**, which {moved} by "
+                     f"{fmt_money(abs(drv['delta']), currency)}{dpct}{share}.")
+    ms = d["mix_shift_leader"]
+    if ms:
+        moved = "a bigger" if ms["to_pct"] > ms["from_pct"] else "a smaller"
+        lines.append(f"In the mix, **{ms['name']}** became {moved} share of {p}, moving from "
+                     f"{ms['from_pct']:.1f}% to {ms['to_pct']:.1f}%.")
+    if pd_delta:
+        exp_pct = d["explained"] / pd_delta * 100
+        if abs(d["unexplained"]) > 0.05 * abs(pd_delta):
+            lines.append(f"Identified components account for {fmt_money(d['explained'], currency)} "
+                         f"of the change ({exp_pct:.0f}%); {fmt_money(d['unexplained'], currency)} is "
+                         f"unexplained — check which line items the feed groups differently before "
+                         f"relying on this split.")
+        else:
+            lines.append("Identified components reconcile closely to the total change, so the "
+                         "breakdown captures essentially all of the movement; next, check whether "
+                         "the biggest driver's trend is likely to persist.")
+    return " ".join(lines)
+
+
 def estimate_valuation(income, balance, cashflow, shares, price,
                        discount_rate, terminal_growth):
     """
@@ -674,6 +836,72 @@ def line_chart(series, title, ylab, color=NAVY):
     return fig
 
 
+# A small, consistent palette for stacked component areas (re-uses the app's
+# core colours, then a few muted tones); 'Other' is rendered in grey.
+MIX_PALETTE = [NAVY, GOLD, GREEN, RED, "#5B8A72", "#A0522D", "#4C6E91",
+               "#9C7BB5", "#B08D57", "#3E7C7B", "#7D5BA6", "#6B7280"]
+OTHER_GREY = "#9AA0A6"
+
+
+def waterfall_chart(d, title, currency):
+    """Contribution waterfall: start -> significant components -> Other -> end."""
+    x = [f"Start ({d['year0']})"]
+    measure = ["absolute"]
+    y = [d["p0"]]
+    for c in d["significant"]:
+        x.append(c["name"])
+        measure.append("relative")
+        y.append(c["delta"])
+    other = d["parent_delta"] - sum(c["delta"] for c in d["significant"])
+    x.append("Other / unexplained")
+    measure.append("relative")
+    y.append(other)
+    x.append(f"End ({d['yearN']})")
+    measure.append("total")
+    y.append(d["pN"])
+    fig = go.Figure(go.Waterfall(
+        orientation="v", measure=measure, x=x, y=y,
+        connector=dict(line=dict(color="#BBBBBB")),
+        increasing=dict(marker=dict(color=GREEN)),
+        decreasing=dict(marker=dict(color=RED)),
+        totals=dict(marker=dict(color=NAVY))))
+    fig.update_layout(title=title, yaxis_title=currency, xaxis_title="",
+                      height=380, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+def mix_shift_chart(df, parent, comp_names, title):
+    """100% stacked area: each component's share of the parent over time."""
+    p = clean_series(df, parent)
+    if len(p) < 2:
+        return None
+    years = list(p.index)
+    fig = go.Figure()
+    sig_sum = pd.Series(0.0, index=years)
+    for k, name in enumerate(comp_names):
+        cs = clean_series(df, name)
+        shares = []
+        for yr in years:
+            pv = p.get(yr)
+            cv = cs.get(yr)
+            ok = (pv not in (None, 0) and cv is not None
+                  and not pd.isna(pv) and not pd.isna(cv))
+            shares.append(cv / pv * 100 if ok else None)
+        ser = pd.Series(shares, index=years, dtype="float")
+        sig_sum = sig_sum.add(ser.fillna(0.0))
+        fig.add_trace(go.Scatter(
+            x=years, y=list(ser.values), name=name, mode="lines", stackgroup="one",
+            line=dict(width=0.5, color=MIX_PALETTE[k % len(MIX_PALETTE)])))
+    other = 100.0 - sig_sum                       # remainder + unexplained -> 100%
+    fig.add_trace(go.Scatter(
+        x=years, y=list(other.values), name="Other / unexplained", mode="lines",
+        stackgroup="one", line=dict(width=0.5, color=OTHER_GREY)))
+    fig.update_layout(title=title, xaxis_title="Fiscal year",
+                      yaxis_title="Share of parent (%)",
+                      height=380, margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # 4. USER INTERFACE
 # ---------------------------------------------------------------------------
@@ -716,7 +944,7 @@ def main():
         return
 
     tabs = st.tabs(["Overview", "Income Statement", "Balance Sheet",
-                    "Cash Flow", "Ratios", "Valuation"])
+                    "Cash Flow", "Decomposition", "Ratios", "Valuation"])
 
     # ---- Overview ---------------------------------------------------------
     with tabs[0]:
@@ -806,8 +1034,78 @@ def main():
             with st.expander("See the underlying numbers"):
                 st.dataframe(df.loc[[item]].style.format("{:,.0f}"))
 
-    # ---- Ratios -----------------------------------------------------------
+    # ---- Decomposition ----------------------------------------------------
     with tabs[4]:
+        st.subheader("Decomposition")
+        st.caption(
+            "For a composite metric, see how it changed over the available years "
+            "and which components drove it — using only this company's reported data."
+        )
+        decomp_sources = {
+            "Income Statement": (income, inc_agg),
+            "Balance Sheet": (balance, bal_agg),
+            "Cash Flow": (cashflow, cf_agg),
+        }
+        avail = {k: v for k, v in decomp_sources.items() if v[0] is not None}
+        if not avail:
+            st.info("No statements are available to decompose for this company.")
+        else:
+            sname = st.selectbox("Statement", list(avail.keys()), key="decomp_stmt")
+            ddf, daggs = avail[sname]
+            parents = [p for p in DECOMP_PARENTS.get(sname, [])
+                       if p in ddf.index and p in daggs
+                       and len(decomposition_children(ddf, p, daggs)) >= 2]
+            if not parents:
+                st.info(f"No decomposable parent metrics with components were found in "
+                        f"the {sname} for this company.")
+            else:
+                parent = st.selectbox("Parent metric", parents, key="decomp_parent")
+                d = decompose(ddf, parent, daggs)
+                if d is None:
+                    st.info("Not enough years of data to decompose this metric.")
+                else:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric(f"{parent} change ({d['span']})",
+                              fmt_money(d["parent_delta"], currency))
+                    m2.metric("Explained by components", fmt_money(d["explained"], currency),
+                              help="Sum of component changes that have both endpoints")
+                    m3.metric("Other / unexplained", fmt_money(d["unexplained"], currency),
+                              help="Parent change minus identified component changes")
+                    if d["driver"] and d["driver"]["delta"] is not None:
+                        drv = d["driver"]
+                        sign = "+" if drv["delta"] >= 0 else "−"
+                        st.markdown(f"**Biggest driver:** {drv['name']} "
+                                    f"({sign}{fmt_money(abs(drv['delta']), currency)})")
+
+                    st.plotly_chart(
+                        waterfall_chart(d, f"{parent}: contribution to change", currency),
+                        use_container_width=True)
+
+                    sig_names = [c["name"] for c in d["significant"]]
+                    if sig_names:
+                        msf = mix_shift_chart(ddf, parent, sig_names,
+                                              f"{parent}: component mix over time")
+                        if msf is not None:
+                            st.plotly_chart(msf, use_container_width=True)
+
+                    table = []
+                    for c in d["components"]:
+                        table.append({
+                            "Component": c["name"],
+                            "First": fmt_money(c["first"], currency) if c["first"] is not None else "n/a",
+                            "Last": fmt_money(c["last"], currency) if c["last"] is not None else "n/a",
+                            "Change": fmt_money(c["delta"], currency) if c["delta"] is not None else "n/a",
+                            "CAGR": f"{c['cagr'] * 100:.1f}%" if c["cagr"] is not None else "n/a",
+                            "% of parent change": f"{c['contrib_pct']:.1f}%" if c["contrib_pct"] is not None else "n/a",
+                        })
+                    st.dataframe(pd.DataFrame(table), use_container_width=True,
+                                 hide_index=True)
+
+                    st.markdown("### What this shows")
+                    st.markdown(decomposition_narrative(d, currency))
+
+    # ---- Ratios -----------------------------------------------------------
+    with tabs[5]:
         st.subheader("Financial ratios")
         ratios = compute_ratios(income, balance, cashflow)
         if not ratios:
@@ -833,7 +1131,7 @@ def main():
                 use_container_width=True)
 
     # ---- Valuation --------------------------------------------------------
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("Valuation (estimate)")
         st.caption(
             "A simple 2-stage discounted-cash-flow model with an earnings-multiple "
