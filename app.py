@@ -742,6 +742,56 @@ def _dedupe_components(df, components, y0, yN):
     return components
 
 
+def _component_signs(df, parent, names):
+    """
+    Infer whether each component ADDS to or SUBTRACTS from its parent, from the
+    company's own reported levels. Returns {name: +1 or -1}.
+
+    We pick the signs s_i that make the identity parent ~= sum(s_i * comp_i)
+    hold best across the shared years (greedy: start all additive, then flip
+    any component whose flip reduces the total reconciliation residual, until
+    stable). For an additive subtotal everything stays +1; for a subtractive
+    one (Gross Profit = Revenue - Cost of Revenue) the cost line resolves to
+    -1. Nothing is keyed to a label.
+    """
+    p = clean_series(df, parent)
+    cols = {}
+    for n in names:
+        s = clean_series(df, n)
+        common = p.index.intersection(s.index)
+        if len(common) >= 2:
+            cols[n] = s
+    if not cols:
+        return {n: 1 for n in names}
+    yrs = p.index
+    for s in cols.values():
+        yrs = yrs.intersection(s.index)
+    if len(yrs) < 2:
+        return {n: 1 for n in names}
+    pv = p[yrs]
+
+    def residual(sign_map):
+        total = None
+        for n, s in cols.items():
+            term = sign_map[n] * s[yrs]
+            total = term if total is None else total + term
+        return float((pv - total).abs().sum())
+
+    signs = {n: 1 for n in cols}
+    best = residual(signs)
+    improved = True
+    while improved:
+        improved = False
+        for n in cols:
+            trial = dict(signs)
+            trial[n] = -trial[n]
+            r = residual(trial)
+            if r < best - 1e-6:
+                signs, best = trial, r
+                improved = True
+    return {n: signs.get(n, 1) for n in names}
+
+
 def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
     """
     Decompose a parent subtotal's change over its full available window into
@@ -761,17 +811,33 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
     p0, pN = float(p.iloc[0]), float(p.iloc[-1])
     parent_delta = pN - p0
 
-    components = []
+    raw = []
     for name in decomposition_children(df, parent, aggregates):
         cs = clean_series(df, name)
         first = float(cs[y0]) if y0 in cs.index else None
         last = float(cs[yN]) if yN in cs.index else None
-        delta = (last - first) if (first is not None and last is not None) else None
+        raw.append({"name": name, "series": cs, "first": first, "last": last,
+                    "cagr": cagr(cs)})
+
+    # Some parents are subtractive (e.g. Gross Profit = Revenue - Cost of
+    # Revenue): a component can REDUCE the parent. Infer each component's sign
+    # (+1 adds, -1 subtracts) from the company's own levels, so contributions
+    # and shares reflect the true effect on the parent instead of treating a
+    # rising cost as if it lifted the result.
+    signs = _component_signs(df, parent, [r["name"] for r in raw])
+
+    components = []
+    for r in raw:
+        name, first, last = r["name"], r["first"], r["last"]
+        sgn = signs.get(name, 1)
+        raw_delta = (last - first) if (first is not None and last is not None) else None
+        delta = (sgn * raw_delta) if raw_delta is not None else None
         contrib = (delta / parent_delta * 100) if (delta is not None and parent_delta) else None
-        share0 = (first / p0 * 100) if (first is not None and p0) else None
-        shareN = (last / pN * 100) if (last is not None and pN) else None
-        components.append({"name": name, "first": first, "last": last, "delta": delta,
-                           "cagr": cagr(cs), "contrib_pct": contrib,
+        share0 = (sgn * first / p0 * 100) if (first is not None and p0) else None
+        shareN = (sgn * last / pN * 100) if (last is not None and pN) else None
+        components.append({"name": name, "first": first, "last": last,
+                           "delta": delta, "raw_delta": raw_delta, "sign": sgn,
+                           "cagr": r["cagr"], "contrib_pct": contrib,
                            "share0": share0, "shareN": shareN})
 
     components = _dedupe_components(df, components, y0, yN)
@@ -801,6 +867,7 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
     driver = None
     if best is not None:
         driver = {"name": best["name"], "delta": best["delta"],
+                  "raw_delta": best.get("raw_delta"), "sign": best.get("sign", 1),
                   "pct": pct_change_total(clean_series(df, best["name"]))}
 
     leader = None
@@ -859,10 +926,15 @@ def _driver_context(d, drv, income, balance, currency):
 
     rev = _series_lookup(income, "Revenue", "Total Revenue", "Net Sales", "Sales")
 
-    # Growth of the driver vs growth of the business (sales).
+    # Growth of the driver vs growth of the business (sales). Skip when the
+    # driver IS revenue (comparing it to itself is meaningless) or when it is a
+    # subtractive line such as cost (handled by the cost wording below instead).
     comp = next((c for c in d["components"] if c["name"] == name), None)
     drv_cagr = comp["cagr"] if comp else None
-    if rev is not None and len(rev) >= 2 and drv_cagr is not None:
+    is_revenue = ("revenue" in low or "net sales" in low or low == "sales")
+    is_subtractive = bool(comp and comp.get("sign", 1) < 0)
+    if (rev is not None and len(rev) >= 2 and drv_cagr is not None
+            and not is_revenue and not is_subtractive):
         rev_cagr = cagr(rev)
         if rev_cagr is not None:
             gap = (drv_cagr - rev_cagr) * 100
@@ -917,6 +989,19 @@ def _driver_context(d, drv, income, balance, currency):
             bits.append(ln + " A rising figure means sales are being booked faster "
                              "than they are being collected.")
 
+    # Subtractive driver (e.g. cost): describe its drag on the parent.
+    if is_subtractive and comp is not None and comp.get("raw_delta") is not None:
+        if rev is not None and comp.get("first") and comp.get("last"):
+            r0 = rev.iloc[0] if len(rev) else None
+            rN = rev.iloc[-1] if len(rev) else None
+            if r0 and rN:
+                c0 = comp["first"] / r0 * 100
+                cN = comp["last"] / rN * 100
+                moved = "up from" if cN > c0 else "down from"
+                bits.append(f"As a share of revenue it ran about {cN:.0f}% "
+                            f"({moved} {c0:.0f}%), so its rise is squeezing the margin "
+                            f"even as the total still grew.")
+
     # Is the latest move unusual for this company?
     full = _series_lookup(balance, name)
     if full is None:
@@ -952,12 +1037,22 @@ def decomposition_narrative(d, currency, income=None, balance=None):
     ]
     drv = d["driver"]
     if drv and drv["delta"] is not None:
-        moved = "rose" if drv["delta"] > 0 else "fell"
+        # The line's own movement vs its effect on the parent can differ in
+        # direction for a subtractive component (a rising cost lowers profit).
+        own_delta = drv.get("raw_delta")
+        own_delta = own_delta if own_delta is not None else drv["delta"]
+        moved = "rose" if own_delta > 0 else "fell"
         dpct = f" ({abs(drv['pct']):.1f}%)" if drv["pct"] is not None else ""
         share = (f", about {abs(drv['delta'] / pd_delta * 100):.0f}% of the net change"
                  if pd_delta else "")
-        lines.append(f"The single biggest driver was **{drv['name']}**, which {moved} by "
-                     f"{fmt_money(abs(drv['delta']), currency)}{dpct}{share}.")
+        if drv.get("sign", 1) < 0:
+            effect = "added to" if drv["delta"] > 0 else "subtracted from"
+            lines.append(f"The single biggest driver was **{drv['name']}**, which {moved} by "
+                         f"{fmt_money(abs(own_delta), currency)}{dpct} and {effect} the total"
+                         f"{share}.")
+        else:
+            lines.append(f"The single biggest driver was **{drv['name']}**, which {moved} by "
+                         f"{fmt_money(abs(own_delta), currency)}{dpct}{share}.")
         ctx = _driver_context(d, drv, income, balance, currency)
         if ctx:
             lines.append(ctx)
