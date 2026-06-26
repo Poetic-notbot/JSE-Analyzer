@@ -627,24 +627,61 @@ def decomposition_children(df, parent, aggregates, cascade=False):
         return []
     order = list(df.index)
     idx = order.index(parent)
+    parent_s = clean_series(df, parent)
+    # Magnitude of the parent on its latest reported year, used to stop the walk
+    # before it crosses into a neighbouring section (see _fits below).
+    parent_mag = abs(float(parent_s.iloc[-1])) if len(parent_s) else None
+
+    def _fits(name, running):
+        """Is this nested subtotal genuinely PART of the parent?
+
+        A real component fits inside the parent: it never exceeds the parent on
+        any shared year, and adding it to what we've already collected does not
+        overshoot the parent. This stops the upward walk at a section boundary
+        (e.g. decomposing 'Total Current Liabilities' must not reach up into the
+        asset rows and grab 'Total Current Assets'/'Total Assets').
+        """
+        s = clean_series(df, name)
+        shared = [(s[y], parent_s[y]) for y in s.index if y in parent_s.index]
+        if not shared:
+            return False
+        if any(abs(sv) > abs(pv) + 1e-6 for sv, pv in shared):
+            return False
+        if parent_mag is not None:
+            sv = abs(float(s.iloc[-1]))
+            if running + sv > parent_mag * 1.05 + 1e-6:
+                return False
+        return True
+
     children = []
+    running = 0.0  # accumulated magnitude of collected components (latest year)
     i = idx - 1
     while i >= 0:
         name = order[i]
+
+        def _mag(n):
+            s = clean_series(df, n)
+            return abs(float(s.iloc[-1])) if len(s) else 0.0
+
         if name in aggregates:
-            children.append(name)                # nested subtotal as one block
             if cascade:
                 # Cascade (e.g. income statement): this nested subtotal is the
                 # running base that already contains everything above it, so it
-                # alone partitions the rest. Stop here instead of summing the
-                # cumulative subtotals above it, which would double-count.
+                # alone partitions the rest. Include it and stop, instead of
+                # summing the cumulative subtotals above it (double-counting).
+                children.append(name)
                 break
+            if not _fits(name, running):
+                break                             # reached a different section
+            children.append(name)                 # nested subtotal as one block
+            running += _mag(name)
             j = i - 1
             while j >= 0 and order[j] not in aggregates:
                 j -= 1                            # skip the rows it rolls up
             i = j
         else:
             children.append(name)
+            running += _mag(name)
             i -= 1
     return list(reversed(children))
 
