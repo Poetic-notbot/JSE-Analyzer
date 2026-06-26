@@ -747,13 +747,18 @@ def _component_signs(df, parent, names):
     Infer whether each component ADDS to or SUBTRACTS from its parent, from the
     company's own reported levels. Returns {name: +1 or -1}.
 
-    We pick the signs s_i that make the identity parent ~= sum(s_i * comp_i)
-    hold best across the shared years (greedy: start all additive, then flip
-    any component whose flip reduces the total reconciliation residual, until
-    stable). For an additive subtotal everything stays +1; for a subtractive
-    one (Gross Profit = Revenue - Cost of Revenue) the cost line resolves to
-    -1. Nothing is keyed to a label.
+    We choose signs s_i so the identity parent ~= sum(s_i * comp_i) holds best
+    across the shared years. With a handful of components we test every sign
+    combination and keep the lowest reconciliation residual (a plain greedy
+    flip can get trapped in a local optimum, e.g. marking Revenue rather than
+    Cost as the subtractive part of Gross Profit). Ties break toward leaving
+    the LARGEST component additive, which avoids the mirror solution where
+    every sign is flipped. Additive subtotals come back all +1; a subtractive
+    one (Gross Profit = Revenue - Cost of Revenue) gives the cost line -1.
+    Nothing is keyed to a label.
     """
+    import itertools
+
     p = clean_series(df, parent)
     cols = {}
     for n in names:
@@ -769,26 +774,49 @@ def _component_signs(df, parent, names):
     if len(yrs) < 2:
         return {n: 1 for n in names}
     pv = p[yrs]
+    keys = list(cols.keys())
+    mats = {k: cols[k][yrs] for k in keys}
+    scale = float(pv.abs().sum()) or 1.0
 
-    def residual(sign_map):
+    def residual(sign_tuple):
         total = None
-        for n, s in cols.items():
-            term = sign_map[n] * s[yrs]
+        for k, sgn in zip(keys, sign_tuple):
+            term = sgn * mats[k]
             total = term if total is None else total + term
         return float((pv - total).abs().sum())
 
-    signs = {n: 1 for n in cols}
-    best = residual(signs)
-    improved = True
-    while improved:
-        improved = False
-        for n in cols:
-            trial = dict(signs)
-            trial[n] = -trial[n]
-            r = residual(trial)
-            if r < best - 1e-6:
-                signs, best = trial, r
-                improved = True
+    # Largest component (by typical magnitude) we prefer to keep additive.
+    biggest = max(keys, key=lambda k: float(mats[k].abs().mean()))
+
+    best_combo, best_res = None, None
+    if len(keys) <= 14:
+        for combo in itertools.product((1, -1), repeat=len(keys)):
+            res = residual(combo)
+            prefer_add = 0 if combo[keys.index(biggest)] == 1 else 1
+            score = (round(res / scale, 6), prefer_add)
+            if best_res is None or score < best_res:
+                best_res, best_combo = score, combo
+    else:
+        # Greedy fallback for unusually wide statements.
+        combo = [1] * len(keys)
+        cur = residual(combo)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(keys)):
+                trial = list(combo)
+                trial[i] = -trial[i]
+                r2 = residual(trial)
+                if r2 < cur - 1e-6:
+                    combo, cur = trial, r2
+                    improved = True
+        best_combo = tuple(combo)
+
+    signs = {k: best_combo[i] for i, k in enumerate(keys)}
+    # Only trust an inferred -1 when reconciliation is genuinely tight;
+    # otherwise treat the parent as additive to avoid spurious sign flips.
+    if best_res is not None and best_res[0] > 0.02 and len(keys) <= 14:
+        signs = {k: 1 for k in keys}
     return {n: signs.get(n, 1) for n in names}
 
 
