@@ -664,16 +664,25 @@ def _dedupe_components(df, components, y0, yN):
     partition the parent (and "explained" doesn't overshoot the total).
 
     The feed sometimes exposes overlapping rows in the same block - e.g. a
-    nested subtotal AND the raw rows it rolls up (the classic
-    "Receivables" vs "Accounts Receivable" double-count), or two labels
-    that carry the identical series. We drop, in order:
-      1. exact duplicate series (keep the first occurrence), and
-      2. any component whose year-by-year series equals the sum of two or
-         more OTHER components in the list (i.e. a subtotal that slipped in).
-    Comparison uses the company's own reported values on the shared years,
-    so nothing is hard-coded to a particular label or company.
+    broad subtotal AND a narrower line nested inside it (the classic
+    "Receivables" total alongside the "Accounts Receivable" it contains),
+    or two labels carrying the same series. Using only the company's own
+    reported values on shared years, we drop, in order:
+
+      1. exact duplicate series (keep the first occurrence);
+      2. a relabel/superset of another - a line that is >= another on every
+         shared year and coincides with it in the latest year (the same item
+         under two labels the feed later merges) - keeping the broader line
+         and dropping the nested duplicate, so the part is counted once; and
+      3. any remaining component whose series equals the sum of two or more
+         OTHER components (a subtotal that slipped in).
+    Nothing is keyed to a particular label or company.
     """
     series = {c["name"]: clean_series(df, c["name"]) for c in components}
+
+    def aligned(a, b):
+        common = a.index.intersection(b.index)
+        return (a[common], b[common]) if len(common) >= 2 else (None, None)
 
     # 1. exact duplicate series -> keep first
     kept, seen = [], []
@@ -681,9 +690,8 @@ def _dedupe_components(df, components, y0, yN):
         s = series[c["name"]]
         dup = False
         for s2 in seen:
-            common = s.index.intersection(s2.index)
-            if len(common) >= 2 and bool(
-                    (s[common].round(2).values == s2[common].round(2).values).all()):
+            x, y = aligned(s, s2)
+            if x is not None and bool((x.round(2).values == y.round(2).values).all()):
                 dup = True
                 break
         if not dup:
@@ -691,15 +699,33 @@ def _dedupe_components(df, components, y0, yN):
             seen.append(s)
     components = kept
 
-    # 2. drop a component equal to the sum of >=2 others (a leaked subtotal)
-    names = [c["name"] for c in components]
+    # 2. relabel/superset -> drop the nested duplicate, keep the broader line
     drop = set()
+    for a in components:
+        for b in components:
+            if a["name"] == b["name"] or a["name"] in drop or b["name"] in drop:
+                continue
+            sa, sb = aligned(series[a["name"]], series[b["name"]])
+            if sa is None:
+                continue
+            tol = 0.01 * (sb.abs().max() or 1.0)
+            ge_all = bool(((sb - sa) >= -tol).all())
+            same_latest = abs(sb.iloc[-1] - sa.iloc[-1]) <= tol
+            gt_some = bool(((sb - sa) > tol).any())
+            if ge_all and same_latest and gt_some:
+                drop.add(a["name"])
+    if drop:
+        components = [c for c in components if c["name"] not in drop]
+
+    # 3. drop a component equal to the sum of >=2 others (a leaked subtotal)
+    names = [c["name"] for c in components]
+    drop2 = set()
     for c in components:
         s = series[c["name"]]
         yrs = list(s.index)
         if len(yrs) < 2:
             continue
-        others = [series[n] for n in names if n != c["name"] and n not in drop]
+        others = [series[n] for n in names if n != c["name"] and n not in drop2]
         if len(others) < 2:
             continue
         total, used = None, 0
@@ -710,9 +736,9 @@ def _dedupe_components(df, components, y0, yN):
         if total is not None and used >= 2:
             scale = s[yrs].abs().max() or 1.0
             if bool(((s[yrs] - total).abs() <= 0.005 * scale).all()):
-                drop.add(c["name"])
-    if drop:
-        components = [c for c in components if c["name"] not in drop]
+                drop2.add(c["name"])
+    if drop2:
+        components = [c for c in components if c["name"] not in drop2]
     return components
 
 
@@ -892,7 +918,9 @@ def _driver_context(d, drv, income, balance, currency):
                              "than they are being collected.")
 
     # Is the latest move unusual for this company?
-    full = _series_lookup(balance, name) or _series_lookup(income, name)
+    full = _series_lookup(balance, name)
+    if full is None:
+        full = _series_lookup(income, name)
     prior_max = _max_prior_yoy(full)
     if full is not None and len(full) >= 3 and prior_max:
         last_step = abs(full.diff().dropna().iloc[-1])
