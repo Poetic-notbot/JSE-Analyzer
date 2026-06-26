@@ -658,6 +658,64 @@ def decomposable_parents(df, aggregates, statement):
     return parents, eff_aggs
 
 
+def _dedupe_components(df, components, y0, yN):
+    """
+    Remove redundant rows from a component list so the parts genuinely
+    partition the parent (and "explained" doesn't overshoot the total).
+
+    The feed sometimes exposes overlapping rows in the same block - e.g. a
+    nested subtotal AND the raw rows it rolls up (the classic
+    "Receivables" vs "Accounts Receivable" double-count), or two labels
+    that carry the identical series. We drop, in order:
+      1. exact duplicate series (keep the first occurrence), and
+      2. any component whose year-by-year series equals the sum of two or
+         more OTHER components in the list (i.e. a subtotal that slipped in).
+    Comparison uses the company's own reported values on the shared years,
+    so nothing is hard-coded to a particular label or company.
+    """
+    series = {c["name"]: clean_series(df, c["name"]) for c in components}
+
+    # 1. exact duplicate series -> keep first
+    kept, seen = [], []
+    for c in components:
+        s = series[c["name"]]
+        dup = False
+        for s2 in seen:
+            common = s.index.intersection(s2.index)
+            if len(common) >= 2 and bool(
+                    (s[common].round(2).values == s2[common].round(2).values).all()):
+                dup = True
+                break
+        if not dup:
+            kept.append(c)
+            seen.append(s)
+    components = kept
+
+    # 2. drop a component equal to the sum of >=2 others (a leaked subtotal)
+    names = [c["name"] for c in components]
+    drop = set()
+    for c in components:
+        s = series[c["name"]]
+        yrs = list(s.index)
+        if len(yrs) < 2:
+            continue
+        others = [series[n] for n in names if n != c["name"] and n not in drop]
+        if len(others) < 2:
+            continue
+        total, used = None, 0
+        for s2 in others:
+            if set(yrs).issubset(set(s2.index)):
+                total = s2[yrs] if total is None else total + s2[yrs]
+                used += 1
+        if total is not None and used >= 2:
+            scale = s[yrs].abs().max() or 1.0
+            if bool(((s[yrs] - total).abs() <= 0.005 * scale).all()):
+                drop.add(c["name"])
+    if drop:
+        components = [c for c in components if c["name"] not in drop]
+    return components
+
+
 def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
     """
     Decompose a parent subtotal's change over its full available window into
@@ -689,6 +747,8 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
         components.append({"name": name, "first": first, "last": last, "delta": delta,
                            "cagr": cagr(cs), "contrib_pct": contrib,
                            "share0": share0, "shareN": shareN})
+
+    components = _dedupe_components(df, components, y0, yN)
 
     deltas = [c["delta"] for c in components if c["delta"] is not None]
     explained = sum(deltas)
@@ -736,8 +796,120 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
             "driver": driver, "mix_shift_leader": mix_shift_leader}
 
 
-def decomposition_narrative(d, currency):
-    """A grounded 2-4 sentence read of a decomposition, from the data only."""
+def _series_lookup(df, *candidates):
+    """First non-empty year->value series among candidate row labels, or None.
+    Lets the narrative resolve items like Revenue / Cost of Revenue / Inventory
+    across the small label variations the feed uses, without hard-coding one."""
+    if df is None:
+        return None
+    for name in candidates:
+        if name in df.index:
+            s = clean_series(df, name)
+            if len(s):
+                return s
+    return None
+
+
+def _max_prior_yoy(series):
+    """Largest absolute year-over-year change BEFORE the final step, so the
+    latest move can be judged against the company's own history."""
+    if series is None or len(series) < 3:
+        return None
+    diffs = series.diff().dropna()
+    if len(diffs) < 2:
+        return None
+    prior = diffs.iloc[:-1]
+    return prior.abs().max() if len(prior) else None
+
+
+def _driver_context(d, drv, income, balance, currency):
+    """A short, data-only contextual read of the biggest driver: how its growth
+    compares to sales, how efficiently the balance is turning (days outstanding),
+    and whether the latest move is unusual for this company. Each clause is
+    emitted only when the underlying rows exist, so it degrades gracefully."""
+    name = drv["name"]
+    low = name.lower()
+    bits = []
+
+    rev = _series_lookup(income, "Revenue", "Total Revenue", "Net Sales", "Sales")
+
+    # Growth of the driver vs growth of the business (sales).
+    comp = next((c for c in d["components"] if c["name"] == name), None)
+    drv_cagr = comp["cagr"] if comp else None
+    if rev is not None and len(rev) >= 2 and drv_cagr is not None:
+        rev_cagr = cagr(rev)
+        if rev_cagr is not None:
+            gap = (drv_cagr - rev_cagr) * 100
+            if abs(gap) >= 1.0:
+                faster = "faster than" if gap > 0 else "slower than"
+                bits.append(
+                    f"It grew about {drv_cagr * 100:.0f}% a year versus roughly "
+                    f"{rev_cagr * 100:.0f}% for revenue, {faster} sales"
+                    + (" - a build that can tie up cash and signals stock piling up "
+                       "ahead of demand" if (gap > 0 and "inventor" in low) else "")
+                    + "."
+                )
+            else:
+                bits.append(
+                    f"It grew roughly in line with revenue "
+                    f"(about {drv_cagr * 100:.0f}% a year), so its rise looks "
+                    f"demand-driven rather than a build-up."
+                )
+
+    # Efficiency: days outstanding, end vs start.
+    def days_line(numer_df, numer_names, label, last_val, first_val):
+        base = _series_lookup(numer_df, *numer_names)
+        if base is None or len(base) < 1:
+            return None
+        out = []
+        for tag, bal in (("now", last_val), ("at the start", first_val)):
+            yr = base.index[-1] if tag == "now" else base.index[0]
+            flow = base.get(yr)
+            if flow and bal is not None and flow != 0:
+                out.append((tag, bal / flow * 365.0))
+        if len(out) == 2:
+            (_, d_now), (_, d_start) = out[0], out[1]
+            move = "up from" if d_now > d_start else "down from"
+            return (f"On the latest figures that is about {d_now:.0f} {label} "
+                    f"({move} {d_start:.0f}), the time it ties up.")
+        elif len(out) == 1:
+            return f"On the latest figures that is about {out[0][1]:.0f} {label}."
+        return None
+
+    first_b = comp["first"] if comp else None
+    last_b = comp["last"] if comp else None
+    if "inventor" in low:
+        ln = days_line(income,
+                       ["Cost of Revenue", "Cost of Goods Sold", "Cost of Sales", "Revenue"],
+                       "days of inventory", last_b, first_b)
+        if ln:
+            bits.append(ln)
+    elif "receivable" in low:
+        ln = days_line(income, ["Revenue", "Total Revenue", "Net Sales", "Sales"],
+                       "days of sales outstanding", last_b, first_b)
+        if ln:
+            bits.append(ln + " A rising figure means sales are being booked faster "
+                             "than they are being collected.")
+
+    # Is the latest move unusual for this company?
+    full = _series_lookup(balance, name) or _series_lookup(income, name)
+    prior_max = _max_prior_yoy(full)
+    if full is not None and len(full) >= 3 and prior_max:
+        last_step = abs(full.diff().dropna().iloc[-1])
+        if last_step >= 1.25 * prior_max:
+            bits.append("The most recent year's jump is the largest single-year move "
+                        "on record for this company, so it stands out from its own history.")
+        else:
+            bits.append("The pace is broadly in keeping with prior years rather than "
+                        "a break from trend.")
+    return " ".join(bits)
+
+
+def decomposition_narrative(d, currency, income=None, balance=None):
+    """A grounded read of a decomposition, from the company's reported data: what
+    moved, the biggest driver, the mix shift, how that driver compares to sales,
+    how long it ties up cash, whether the move is unusual, and how cleanly the
+    parts reconcile to the total."""
     if d is None or d["parent_delta"] is None:
         return "Not enough data to decompose this metric."
     p = d["parent"]
@@ -758,6 +930,9 @@ def decomposition_narrative(d, currency):
                  if pd_delta else "")
         lines.append(f"The single biggest driver was **{drv['name']}**, which {moved} by "
                      f"{fmt_money(abs(drv['delta']), currency)}{dpct}{share}.")
+        ctx = _driver_context(d, drv, income, balance, currency)
+        if ctx:
+            lines.append(ctx)
     ms = d["mix_shift_leader"]
     if ms:
         moved = "a bigger" if ms["to_pct"] > ms["from_pct"] else "a smaller"
@@ -768,12 +943,10 @@ def decomposition_narrative(d, currency):
         if abs(d["unexplained"]) > 0.05 * abs(pd_delta):
             lines.append(f"Identified components account for {fmt_money(d['explained'], currency)} "
                          f"of the change ({exp_pct:.0f}%); {fmt_money(d['unexplained'], currency)} is "
-                         f"unexplained — check which line items the feed groups differently before "
-                         f"relying on this split.")
+                         f"unexplained — the rest sits in rows the feed groups differently.")
         else:
             lines.append("Identified components reconcile closely to the total change, so the "
-                         "breakdown captures essentially all of the movement; next, check whether "
-                         "the biggest driver's trend is likely to persist.")
+                         "breakdown captures essentially all of the movement.")
     return " ".join(lines)
 
 
@@ -959,6 +1132,23 @@ def mix_shift_chart(df, parent, comp_names, title):
 
 def main():
     st.set_page_config(page_title="JSE Financial Analyzer", layout="wide")
+    # Keep metric values (e.g. "JMD 523.7M") from being clipped in the narrow
+    # 1/3-width columns used on the Decomposition and Ratios tabs.
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMetricValue"] {
+            font-size: 1.45rem;
+            line-height: 1.2;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+        [data-testid="stMetricValue"] > div { overflow: visible; }
+        [data-testid="stMetricLabel"] { white-space: normal; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("Jamaican Stock Financial Statement Analyzer")
     st.caption(
         "Pick a company, then drill into any line item to see how the business "
@@ -1154,7 +1344,7 @@ def main():
                                  hide_index=True)
 
                     st.markdown("### What this shows")
-                    st.markdown(decomposition_narrative(d, currency))
+                    st.markdown(decomposition_narrative(d, currency, income, balance))
 
     # ---- Ratios -----------------------------------------------------------
     with tabs[5]:
