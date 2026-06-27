@@ -1334,6 +1334,666 @@ def mix_shift_chart(df, parent, comp_names, title):
 
 
 # ---------------------------------------------------------------------------
+# ======================================================================
+#  Business Classification Engine
+#  ---------------------------------------------------------------------
+#  Turns the raw statements into a forensic, financials-justified verdict:
+#  a company "type" (industrial / bank / insurer / reit / holding), a set
+#  of pillar scores, plain-English risks, a near-term refinancing read,
+#  and a final stamp (Cash machine, Wide moat, Compounder, Fortress,
+#  Deteriorating, Grenade, ...).  Everything is derived only from the
+#  reported figures the feed actually supports - no fabricated maturity
+#  ladders, no opinions.
+# ======================================================================
+
+def _last(series):
+    """Latest non-null value of a clean_series (year-ascending)."""
+    if series is None or len(series) == 0:
+        return None
+    return float(series.iloc[-1])
+
+
+def _vals(series):
+    if series is None:
+        return []
+    return [float(x) for x in series.tolist()]
+
+
+def _series_cagr(series):
+    v = _vals(series)
+    if len(v) < 2 or v[0] <= 0 or v[-1] <= 0:
+        return None
+    try:
+        out = (v[-1] / v[0]) ** (1.0 / (len(v) - 1)) - 1.0
+        if isinstance(out, complex):
+            return None
+        return out
+    except Exception:
+        return None
+
+
+def _pick(df, *titles):
+    """First title present (non-empty) in the dataframe, as a clean series."""
+    for t in titles:
+        s = clean_series(df, t)
+        if len(s) > 0:
+            return s
+    return pd.Series(dtype=float)
+
+
+def detect_company_type(income, balance):
+    """Classify the reporting template so we score like-for-like."""
+    if income is None:
+        return "unknown"
+    idx = list(income.index)
+    has = lambda *names: any(n in idx for n in names)
+    if has("Net Interest Income", "Total Interest Income", "Interest Income on Loans"):
+        return "bank"
+    if has("Premiums & Annuity Revenue", "Policy Benefits", "Total Premiums Earned"):
+        return "insurer"
+    if has("Rental Revenue", "Tenant Reimbursements"):
+        return "reit"
+    rev = _last(_pick(income, "Revenue", "Total Revenue"))
+    assets = _last(clean_series(balance, "Total Assets")) if balance is not None else None
+    if rev is not None and assets and assets > 0 and abs(rev) / assets < 0.15:
+        return "holding"
+    return "industrial"
+
+
+
+def build_metric_panel(income, balance, cashflow):
+    """Compute the forensic metric set used by every classifier."""
+    I, B, C = income, balance, cashflow
+    p = {}
+
+    rev   = _pick(I, "Revenue", "Total Revenue")
+    ebit  = clean_series(I, "EBIT")
+    oi    = clean_series(I, "Operating Income")
+    ebitda = clean_series(I, "EBITDA")
+    gp    = clean_series(I, "Gross Profit")
+    ni    = clean_series(I, "Net Income")
+    nic   = clean_series(I, "Net Income to Common")
+    intex = clean_series(I, "Interest Expense")
+    if len(intex) == 0:
+        intex = _pick(I, "Total Interest Expense", "Net Interest Expenses")
+
+    assets = clean_series(B, "Total Assets") if B is not None else pd.Series(dtype=float)
+    equity = _pick(B, "Total Common Equity", "Shareholders' Equity") if B is not None else pd.Series(dtype=float)
+    debt   = clean_series(B, "Total Debt") if B is not None else pd.Series(dtype=float)
+    cash   = _pick(B, "Cash & Equivalents", "Cash & Cash Equivalents") if B is not None else pd.Series(dtype=float)
+    cura   = clean_series(B, "Total Current Assets") if B is not None else pd.Series(dtype=float)
+    curl   = clean_series(B, "Total Current Liabilities") if B is not None else pd.Series(dtype=float)
+    stdebt = _pick(B, "Short-Term Debt", "Short-Term Borrowings") if B is not None else pd.Series(dtype=float)
+    cpltd  = clean_series(B, "Current Portion of Long-Term Debt") if B is not None else pd.Series(dtype=float)
+    clease = clean_series(B, "Current Portion of Leases") if B is not None else pd.Series(dtype=float)
+    ltdebt = clean_series(B, "Long-Term Debt") if B is not None else pd.Series(dtype=float)
+    ltlease = clean_series(B, "Long-Term Leases") if B is not None else pd.Series(dtype=float)
+
+    ocf   = clean_series(C, "Operating Cash Flow") if C is not None else pd.Series(dtype=float)
+    fcf   = clean_series(C, "Free Cash Flow") if C is not None else pd.Series(dtype=float)
+    capex = clean_series(C, "Capital Expenditures") if C is not None else pd.Series(dtype=float)
+    div   = clean_series(C, "Dividends Paid") if C is not None else pd.Series(dtype=float)
+
+    p["rev"] = _last(rev); p["ebit"] = _last(ebit); p["oi"] = _last(oi)
+    p["ebitda"] = _last(ebitda); p["gp"] = _last(gp)
+    p["ni"] = _last(ni); p["nic"] = _last(nic)
+    ie = _last(intex)
+    p["intExp"] = abs(ie) if ie is not None else None
+    p["assets"] = _last(assets); p["equity"] = _last(equity)
+    p["debt"] = _last(debt) or 0.0; p["cash"] = _last(cash) or 0.0
+    p["curAssets"] = _last(cura); p["curLiab"] = _last(curl)
+    p["stDebt"] = _last(stdebt) or 0.0
+    p["curPortLTD"] = _last(cpltd) or 0.0
+    p["curLeases"] = _last(clease) or 0.0
+    p["ltDebt"] = _last(ltdebt) or 0.0
+    p["ltLeases"] = _last(ltlease) or 0.0
+    p["ocf"] = _last(ocf); p["fcf"] = _last(fcf)
+    p["capex"] = _last(capex); p["div"] = _last(div)
+
+    ebitV = p["ebit"] if p["ebit"] is not None else p["oi"]
+    p["ebitUsed"] = ebitV
+    rv = p["rev"]
+    p["opMargin"]    = (ebitV / rv) if (rv and ebitV is not None) else None
+    p["grossMargin"] = (p["gp"] / rv) if (rv and p["gp"] is not None) else None
+    p["netMargin"]   = (p["ni"] / rv) if (rv and p["ni"] is not None) else None
+    eq = p["equity"]
+    earn = p["nic"] if p["nic"] is not None else p["ni"]
+    p["roe"] = (earn / eq) if (eq and eq > 0 and earn is not None) else None
+    p["roa"] = (p["ni"] / p["assets"]) if (p["assets"] and p["assets"] > 0 and p["ni"] is not None) else None
+    p["netDebt"] = p["debt"] - p["cash"]
+    if p["ebitda"] and p["ebitda"] > 0:
+        p["netDebtToEbitda"] = p["netDebt"] / p["ebitda"]
+    elif p["netDebt"] <= 0:
+        p["netDebtToEbitda"] = -99.0
+    else:
+        p["netDebtToEbitda"] = None
+    p["debtToEquity"] = (p["debt"] / eq) if (eq and eq > 0) else None
+    if p["intExp"] and p["intExp"] > 0 and ebitV is not None:
+        p["intCover"] = ebitV / p["intExp"]
+    elif not p["intExp"]:
+        p["intCover"] = float("inf")
+    else:
+        p["intCover"] = None
+    p["currentRatio"] = (p["curAssets"] / p["curLiab"]) if (p["curLiab"] and p["curLiab"] > 0 and p["curAssets"] is not None) else None
+    p["currentDebtDue"] = p["stDebt"] + p["curPortLTD"] + p["curLeases"]
+    p["fcfMargin"] = (p["fcf"] / rv) if (rv and p["fcf"] is not None) else None
+    p["cashConversion"] = (p["ocf"] / p["ni"]) if (p["ni"] and p["ni"] > 0 and p["ocf"] is not None) else None
+    p["revCagr"] = _series_cagr(rev)
+    p["ebitCagr"] = _series_cagr(ebit) if len(ebit) else _series_cagr(oi)
+    p["niCagr"] = _series_cagr(ni)
+    p["fcfPositive"] = (p["fcf"] > 0) if p["fcf"] is not None else None
+
+    niv = _vals(ni); p["lossYears"] = sum(1 for x in niv if x < 0); p["totalYears"] = len(niv)
+    p["niLast"] = niv[-1] if niv else None
+    p["niPrev"] = niv[-2] if len(niv) > 1 else None
+    p["niDeteriorating"] = bool(p["niLast"] is not None and p["niPrev"] is not None
+                                and p["niLast"] < p["niPrev"] and p["niLast"] < abs(p["niPrev"]) * 0.5)
+    rvv = _vals(rev); ev = _vals(ebit) if len(ebit) else _vals(oi)
+    om = [ev[i] / rvv[i] for i in range(min(len(ev), len(rvv))) if rvv[i] and rvv[i] > 0]
+    p["omSeries"] = om
+    p["omNegYears"] = sum(1 for x in om if x < 0)
+    p["recentCollapse"] = bool(len(om) >= 3 and om[-1] < 0 and any(x > 0.03 for x in om[:-1]))
+    p["structurallyWeak"] = bool((p["totalYears"] >= 3 and p["lossYears"] >= (p["totalYears"] + 1) // 2)
+                                 or (len(om) >= 3 and p["omNegYears"] >= (len(om) + 1) // 2))
+    p["opMarginStart"] = om[0] if om else None
+    p["opMarginEnd"] = om[-1] if om else None
+    dq = 1.0; flags = []
+    if any(x is not None and x < 0 for x in rvv):
+        dq -= 0.5; flags.append("revenue is negative in some years - figures unreliable")
+    if p["totalYears"] < 3:
+        dq -= 0.3; flags.append("short reporting history")
+    p["dataConfidence"] = max(0.0, dq)
+    p["dqFlags"] = flags
+    return p
+
+
+
+def _refinancing_read(p, currency):
+    """Near-term debt obligations vs the resources to meet them.
+    Uses only what the feed reports (current portion of debt + leases,
+    short-term borrowings, cash, free cash flow). It is a near-term
+    refinancing-risk read, NOT a full year-by-year maturity ladder
+    (that lives in the audited notes and is not in this data)."""
+    due = p["currentDebtDue"]
+    cash = p["cash"] or 0.0
+    fcf = p["fcf"] if p["fcf"] is not None else 0.0
+    breakdown = []
+    if p["stDebt"]:     breakdown.append(("Short-term borrowings", p["stDebt"]))
+    if p["curPortLTD"]: breakdown.append(("Current portion of long-term debt", p["curPortLTD"]))
+    if p["curLeases"]:  breakdown.append(("Current portion of leases", p["curLeases"]))
+    resources = cash + (fcf if fcf > 0 else 0.0)
+    cover = (resources / due) if due > 0 else None
+    if due <= 0:
+        level, msg = "none", "No debt or leases falling due within a year that the feed reports."
+    elif cover is None:
+        level, msg = "unknown", "Near-term maturities could not be assessed."
+    elif cover >= 2.0:
+        level = "low"
+        msg = ("Cash plus free cash flow cover near-term maturities about "
+               "{:.1f}x - comfortable.".format(cover))
+    elif cover >= 1.0:
+        level = "moderate"
+        msg = ("Cash plus free cash flow cover near-term maturities about "
+               "{:.1f}x - manageable but with little buffer.".format(cover))
+    else:
+        level = "high"
+        msg = ("Cash plus free cash flow cover only {:.0%} of debt falling due "
+               "within a year - the company depends on rolling over / "
+               "refinancing this debt.".format(cover))
+    return {
+        "due": due, "breakdown": breakdown, "cash": cash, "fcf": fcf,
+        "cover": cover, "level": level, "message": msg,
+        "longTermDebt": p["ltDebt"], "longTermLeases": p["ltLeases"],
+        "netDebt": p["netDebt"], "netDebtToEbitda": p["netDebtToEbitda"],
+        "intCover": p["intCover"],
+    }
+
+
+def score_industrial(p):
+    pillars, reasons = {}, {}
+
+    s, r = 0, []
+    if p["roe"] is not None:
+        if p["roe"] >= 0.20: s += 30; r.append("ROE {:.0%} (excellent)".format(p["roe"]))
+        elif p["roe"] >= 0.12: s += 22; r.append("ROE {:.0%} (good)".format(p["roe"]))
+        elif p["roe"] >= 0.07: s += 12; r.append("ROE {:.0%} (modest)".format(p["roe"]))
+        elif p["roe"] > 0: s += 4; r.append("ROE {:.0%} (weak)".format(p["roe"]))
+        else: r.append("ROE is negative")
+    if p["roa"] is not None:
+        if p["roa"] >= 0.10: s += 20; r.append("ROA {:.0%} (high)".format(p["roa"]))
+        elif p["roa"] >= 0.05: s += 14
+        elif p["roa"] > 0: s += 6
+    if p["opMargin"] is not None:
+        if p["opMargin"] >= 0.20: s += 25; r.append("operating margin {:.0%} (strong pricing power)".format(p["opMargin"]))
+        elif p["opMargin"] >= 0.10: s += 16; r.append("operating margin {:.0%}".format(p["opMargin"]))
+        elif p["opMargin"] >= 0.05: s += 8
+        elif p["opMargin"] > 0: s += 3
+        else: r.append("operating margin is negative")
+    if p["netMargin"] is not None:
+        if p["netMargin"] >= 0.10: s += 15
+        elif p["netMargin"] >= 0.05: s += 9
+        elif p["netMargin"] > 0: s += 3
+    if p["grossMargin"] is not None and p["grossMargin"] >= 0.40:
+        s += 10; r.append("gross margin {:.0%}".format(p["grossMargin"]))
+    pillars["Profitability"] = min(100, s); reasons["Profitability"] = r
+
+    s, r = 0, []
+    if p["fcfPositive"] is True: s += 30; r.append("free cash flow is positive")
+    elif p["fcfPositive"] is False: r.append("free cash flow is negative")
+    if p["fcfMargin"] is not None:
+        if p["fcfMargin"] >= 0.12: s += 30; r.append("FCF margin {:.0%} (cash-machine territory)".format(p["fcfMargin"]))
+        elif p["fcfMargin"] >= 0.06: s += 20; r.append("FCF margin {:.0%}".format(p["fcfMargin"]))
+        elif p["fcfMargin"] > 0: s += 10
+    if p["cashConversion"] is not None:
+        if p["cashConversion"] >= 1.0: s += 25; r.append("operating cash {:.2f}x of net income (earnings are cash-backed)".format(p["cashConversion"]))
+        elif p["cashConversion"] >= 0.7: s += 15
+        elif p["cashConversion"] > 0: s += 5; r.append("operating cash only {:.2f}x of net income (earnings not fully cash-backed)".format(p["cashConversion"]))
+    if p["fcf"] is not None and p["ocf"] is not None and p["capex"] is not None and p["ocf"] > 0:
+        if abs(p["capex"]) / p["ocf"] < 0.4: s += 15; r.append("low capital intensity")
+    pillars["Cash generation"] = min(100, s); reasons["Cash generation"] = r
+
+    s, r = 100, []
+    nd = p["netDebtToEbitda"]
+    if nd is not None:
+        if nd <= 0: r.append("net cash position")
+        elif nd <= 1.5: s -= 5
+        elif nd <= 3: s -= 20; r.append("net debt {:.1f}x EBITDA (moderate leverage)".format(nd))
+        elif nd <= 4.5: s -= 40; r.append("net debt {:.1f}x EBITDA (high leverage)".format(nd))
+        else: s -= 60; r.append("net debt {:.1f}x EBITDA (dangerous leverage)".format(nd))
+    ic = p["intCover"]
+    if ic is not None and ic != float("inf"):
+        if ic < 1.5: s -= 30; r.append("interest coverage {:.1f}x (earnings barely cover interest)".format(ic))
+        elif ic < 3: s -= 15; r.append("interest coverage {:.1f}x (thin)".format(ic))
+    if p["currentRatio"] is not None:
+        if p["currentRatio"] < 1: s -= 20; r.append("current ratio {:.2f} (current liabilities exceed current assets)".format(p["currentRatio"]))
+        elif p["currentRatio"] < 1.2: s -= 8
+    if p["currentDebtDue"] > 0:
+        resources = (p["cash"] or 0) + (p["fcf"] if (p["fcf"] or 0) > 0 else 0)
+        cover = resources / p["currentDebtDue"]
+        if cover < 1: s -= 25; r.append("debt due within a year exceeds cash + free cash flow (refinancing-dependent)")
+        elif cover < 1.5: s -= 10; r.append("near-term debt only modestly covered by cash + free cash flow")
+    pillars["Balance sheet"] = max(0, min(100, s)); reasons["Balance sheet"] = r
+
+    s, r = 0, []
+    if p["revCagr"] is not None:
+        if p["revCagr"] >= 0.12: s += 35; r.append("revenue compounding {:.0%}/yr".format(p["revCagr"]))
+        elif p["revCagr"] >= 0.05: s += 25; r.append("revenue growing {:.0%}/yr".format(p["revCagr"]))
+        elif p["revCagr"] >= 0: s += 12
+        else: r.append("revenue shrinking ({:.0%}/yr)".format(p["revCagr"]))
+    if p["ebitCagr"] is not None:
+        if p["ebitCagr"] >= 0.12: s += 35
+        elif p["ebitCagr"] >= 0.05: s += 22
+        elif p["ebitCagr"] >= 0: s += 10
+        else: r.append("operating profit declining")
+    if p["opMarginStart"] is not None and p["opMarginEnd"] is not None:
+        d = p["opMarginEnd"] - p["opMarginStart"]
+        if d >= 0.02: s += 30; r.append("margins expanding")
+        elif d >= -0.01: s += 18
+        else: r.append("margins compressing")
+    pillars["Growth"] = min(100, s); reasons["Growth"] = r
+
+    s, r = 0, []
+    high_returns = (p["roe"] is not None and p["roe"] >= 0.15) and (p["roa"] is not None and p["roa"] >= 0.08)
+    fat = (p["opMargin"] is not None and p["opMargin"] >= 0.18)
+    stable = (p["opMarginStart"] is not None and p["opMarginEnd"] is not None and p["opMarginEnd"] >= p["opMarginStart"] - 0.03)
+    if high_returns: s += 40; r.append("consistently high returns on capital")
+    if fat: s += 30; r.append("wide operating margins (pricing power)")
+    if stable and fat: s += 15; r.append("margins are durable")
+    if p["fcfMargin"] is not None and p["fcfMargin"] >= 0.12: s += 15; r.append("strong cash conversion")
+    pillars["Moat"] = min(100, s); reasons["Moat"] = r
+
+    return pillars, reasons
+
+
+
+def detect_risks(p, ctype):
+    """Plain-English, financials-backed risks to watch."""
+    risks = []
+    if p["recentCollapse"]:
+        risks.append(("Earnings collapse", "Operating profit turned negative in the latest year after being positive earlier - something has broken recently and needs explaining before any purchase."))
+    elif p["niDeteriorating"]:
+        risks.append(("Deteriorating profit", "The latest year's net profit fell sharply versus the prior year - momentum is negative."))
+    nd = p["netDebtToEbitda"]
+    if nd is not None and nd > 4.5:
+        risks.append(("Heavy leverage", "Net debt is more than 4.5x EBITDA - a downturn or rate rise could overwhelm the balance sheet."))
+    elif nd is not None and nd > 3:
+        risks.append(("Elevated leverage", "Net debt is over 3x EBITDA - manageable in good times, punishing in bad ones."))
+    ic = p["intCover"]
+    if ic is not None and ic != float("inf") and ic < 2:
+        risks.append(("Thin interest cover", "Operating profit covers interest less than 2x - little room for a profit wobble."))
+    if p["currentRatio"] is not None and p["currentRatio"] < 1:
+        risks.append(("Liquidity squeeze", "Current liabilities exceed current assets - the company relies on continued cash generation or rollovers to pay near-term bills."))
+    if p["currentDebtDue"] > 0:
+        resources = (p["cash"] or 0) + (p["fcf"] if (p["fcf"] or 0) > 0 else 0)
+        if resources / p["currentDebtDue"] < 1:
+            risks.append(("Refinancing dependence", "Debt falling due within a year is larger than cash plus free cash flow - the company must refinance, which is risky if credit tightens."))
+    if p["fcfPositive"] is False and (p["lossYears"] or 0) == 0:
+        risks.append(("Cash burn despite profits", "The company reports profits but free cash flow is negative - profits are not turning into cash (watch working capital or heavy capex)."))
+    if p["cashConversion"] is not None and p["cashConversion"] < 0.6 and p["cashConversion"] > 0:
+        risks.append(("Low cash conversion", "Operating cash flow is well below reported net income - earnings quality is questionable."))
+    if p["opMarginStart"] is not None and p["opMarginEnd"] is not None and (p["opMarginEnd"] - p["opMarginStart"]) < -0.03:
+        risks.append(("Margin erosion", "Operating margins have compressed over the period - pricing power or cost control is slipping."))
+    if p["revCagr"] is not None and p["revCagr"] < 0:
+        risks.append(("Shrinking top line", "Revenue is falling over the period - the business is contracting."))
+    if p["structurallyWeak"]:
+        risks.append(("Chronic unprofitability", "The company has lost money in most of the years reported - this is a structural problem, not a blip."))
+    if ctype == "bank" and p["equity"] and p["assets"] and (p["equity"] / p["assets"]) < 0.06:
+        risks.append(("Thin capital buffer", "Equity is a small share of assets - a bank with little cushion against loan losses."))
+    if not risks:
+        risks.append(("No major red flags", "On the reported figures, no significant financial red flags stand out - keep watching the usual operating metrics."))
+    return risks
+
+
+
+def classify_business(p, pillars, ctype):
+    """Map the evidence to stamps + an overall verdict tier."""
+    stamps = []
+    weights = {"Profitability": 0.25, "Cash generation": 0.22, "Balance sheet": 0.23, "Growth": 0.15, "Moat": 0.15}
+    overall = round(sum(pillars.get(k, 0) * w for k, w in weights.items()))
+
+    prof = pillars.get("Profitability", 0); cashp = pillars.get("Cash generation", 0)
+    bal = pillars.get("Balance sheet", 0); grow = pillars.get("Growth", 0); moat = pillars.get("Moat", 0)
+
+    structural = p["structurallyWeak"]
+    collapsing = p["recentCollapse"] or p["niDeteriorating"]
+
+    resources = (p["cash"] or 0) + (p["fcf"] if (p["fcf"] or 0) > 0 else 0)
+    cant_service = (p["intCover"] is not None and p["intCover"] != float("inf") and p["intCover"] < 1
+                    and p["currentDebtDue"] > 0 and resources < p["currentDebtDue"])
+    grenade = (structural
+               or (cant_service and not collapsing)
+               or (p["netDebtToEbitda"] is not None and p["netDebtToEbitda"] > 5 and p["fcfPositive"] is False)
+               or bal < 15)
+
+    if grenade:
+        stamps.append(("Grenade", "Structural financial damage - lossmaking across most of its history and/or unable to service its debt. The kind of business to stay well away from."))
+    if collapsing and not grenade:
+        stamps.append(("Falling knife", "Was viable but the latest results show a sharp deterioration. Do not catch it until the bleeding stops and you understand the cause."))
+    if bal >= 85 and (p["netDebtToEbitda"] is None or p["netDebtToEbitda"] <= 1):
+        stamps.append(("Fortress balance sheet", "Little or no net debt and ample liquidity - built to survive a downturn."))
+    if p["fcfMargin"] is not None and p["fcfMargin"] >= 0.12 and cashp >= 60 and not collapsing:
+        stamps.append(("Cash machine", "Turns a large slice of revenue into free cash flow - the hallmark of a high-quality, self-funding business."))
+    if moat >= 70 and not collapsing:
+        stamps.append(("Wide moat", "High, durable returns on capital and fat margins point to a strong competitive advantage."))
+    elif moat >= 45 and not collapsing:
+        stamps.append(("Narrow moat", "Some evidence of a competitive edge in its returns and margins, but not yet decisive."))
+    if grow >= 65 and prof >= 60 and (p["roe"] is not None and p["roe"] >= 0.15) and not collapsing:
+        stamps.append(("Compounder", "Growing while earning high returns on capital - the kind of business that builds value year after year."))
+    if (not grenade and not collapsing) and (grow < 35 or (p["opMarginStart"] is not None and p["opMarginEnd"] is not None and p["opMarginEnd"] < p["opMarginStart"] - 0.02)):
+        stamps.append(("Margins under pressure", "Sluggish growth or compressing margins - the business is running to stand still."))
+    if not grenade and not collapsing and prof >= 50 and bal >= 60 and not stamps:
+        stamps.append(("Steady operator", "Solidly profitable with a sound balance sheet, without standout growth or a clear moat - a dependable holding."))
+    if not stamps:
+        stamps.append(("Mixed picture", "The financials send mixed signals - read the detail below before forming a view."))
+
+    if grenade: tier = "Avoid"
+    elif collapsing: tier = "Caution - deteriorating"
+    elif overall >= 72: tier = "High quality"
+    elif overall >= 55: tier = "Solid"
+    elif overall >= 40: tier = "Mixed / watch"
+    else: tier = "Weak"
+
+    seen = set(); uniq = []
+    for s in stamps:
+        if s[0] not in seen:
+            seen.add(s[0]); uniq.append(s)
+    return {"overall": overall, "tier": tier, "stamps": uniq}
+
+
+
+def build_financial_panel(income, balance, cashflow):
+    """A type-appropriate panel for banks, insurers and holding/investment
+    companies, where operating-margin and FCF logic do not apply."""
+    I, B = income, balance
+    p = {}
+    rev   = _pick(I, "Revenue", "Total Revenue")
+    nii   = clean_series(I, "Net Interest Income")
+    tnie  = clean_series(I, "Total Non-Interest Expense")
+    ni    = clean_series(I, "Net Income")
+    nic   = clean_series(I, "Net Income to Common")
+    assets = clean_series(B, "Total Assets") if B is not None else pd.Series(dtype=float)
+    equity = _pick(B, "Total Common Equity", "Shareholders' Equity") if B is not None else pd.Series(dtype=float)
+    debt   = clean_series(B, "Total Debt") if B is not None else pd.Series(dtype=float)
+
+    p["rev"] = _last(rev); p["ni"] = _last(ni); p["nic"] = _last(nic)
+    p["assets"] = _last(assets); p["equity"] = _last(equity); p["debt"] = _last(debt) or 0.0
+    earn = p["nic"] if p["nic"] is not None else p["ni"]
+    p["roa"] = (p["ni"] / p["assets"]) if (p["assets"] and p["assets"] > 0 and p["ni"] is not None) else None
+    p["roe"] = (earn / p["equity"]) if (p["equity"] and p["equity"] > 0 and earn is not None) else None
+    p["equityToAssets"] = (p["equity"] / p["assets"]) if (p["assets"] and p["equity"]) else None
+    p["efficiency"] = (abs(_last(tnie)) / p["rev"]) if (p["rev"] and _last(tnie) is not None) else None
+    p["debtToEquity"] = (p["debt"] / p["equity"]) if (p["equity"] and p["equity"] > 0) else None
+    p["revCagr"] = _series_cagr(rev); p["niCagr"] = _series_cagr(ni)
+    p["equityCagr"] = _series_cagr(equity)
+
+    niv = _vals(ni); p["lossYears"] = sum(1 for x in niv if x < 0); p["totalYears"] = len(niv)
+    p["niLast"] = niv[-1] if niv else None
+    p["niPrev"] = niv[-2] if len(niv) > 1 else None
+    p["niDeteriorating"] = bool(p["niLast"] is not None and p["niPrev"] is not None
+                                and p["niLast"] < p["niPrev"] and p["niLast"] < abs(p["niPrev"]) * 0.5)
+    p["structurallyWeak"] = bool(p["totalYears"] >= 3 and p["lossYears"] >= (p["totalYears"] + 1) // 2)
+    p["recentCollapse"] = False
+    p["intCover"] = None; p["netDebtToEbitda"] = None; p["currentRatio"] = None
+    p["currentDebtDue"] = 0.0; p["cash"] = 0.0; p["fcf"] = None; p["fcfPositive"] = None
+    p["cashConversion"] = None; p["opMarginStart"] = None; p["opMarginEnd"] = None
+    p["stDebt"] = 0.0; p["curPortLTD"] = 0.0; p["curLeases"] = 0.0; p["ltDebt"] = _last(debt) or 0.0; p["ltLeases"] = 0.0
+    p["dataConfidence"] = 1.0 if p["totalYears"] >= 3 else 0.7
+    p["dqFlags"] = [] if p["totalYears"] >= 3 else ["short reporting history"]
+    return p
+
+
+def score_financial(p, ctype):
+    pillars, reasons = {}, {}
+    s, r = 0, []
+    if p["roe"] is not None:
+        if p["roe"] >= 0.15: s += 45; r.append("ROE {:.0%} (strong for a financial)".format(p["roe"]))
+        elif p["roe"] >= 0.10: s += 32; r.append("ROE {:.0%}".format(p["roe"]))
+        elif p["roe"] >= 0.06: s += 18; r.append("ROE {:.0%} (modest)".format(p["roe"]))
+        elif p["roe"] > 0: s += 6; r.append("ROE {:.0%} (weak)".format(p["roe"]))
+        else: r.append("ROE negative")
+    if p["roa"] is not None:
+        if ctype == "bank":
+            if p["roa"] >= 0.02: s += 40; r.append("ROA {:.1%} (excellent for a bank)".format(p["roa"]))
+            elif p["roa"] >= 0.012: s += 28; r.append("ROA {:.1%} (good)".format(p["roa"]))
+            elif p["roa"] >= 0.006: s += 14
+            elif p["roa"] > 0: s += 4
+        else:
+            if p["roa"] >= 0.06: s += 40
+            elif p["roa"] >= 0.03: s += 26
+            elif p["roa"] > 0: s += 10
+    pillars["Returns"] = min(100, s); reasons["Returns"] = r
+    s, r = 0, []
+    eta = p["equityToAssets"]
+    if eta is not None:
+        if ctype == "bank":
+            if eta >= 0.12: s += 70; r.append("equity {:.0%} of assets (well capitalised)".format(eta))
+            elif eta >= 0.08: s += 50; r.append("equity {:.0%} of assets (adequate)".format(eta))
+            elif eta >= 0.06: s += 30; r.append("equity {:.0%} of assets (thin)".format(eta))
+            else: s += 10; r.append("equity only {:.0%} of assets (low capital buffer)".format(eta))
+        else:
+            if eta >= 0.5: s += 70; r.append("equity {:.0%} of assets (lightly geared)".format(eta))
+            elif eta >= 0.3: s += 50
+            elif eta >= 0.15: s += 30
+            else: s += 12; r.append("highly geared")
+    if p["debtToEquity"] is not None and p["debtToEquity"] < 0.3:
+        s += 30; r.append("little external debt")
+    pillars["Capital strength"] = min(100, s); reasons["Capital strength"] = r
+    s, r = 0, []
+    if p["efficiency"] is not None:
+        if p["efficiency"] <= 0.5: s += 50; r.append("cost-to-income {:.0%} (very efficient)".format(p["efficiency"]))
+        elif p["efficiency"] <= 0.6: s += 38; r.append("cost-to-income {:.0%} (efficient)".format(p["efficiency"]))
+        elif p["efficiency"] <= 0.7: s += 22; r.append("cost-to-income {:.0%}".format(p["efficiency"]))
+        else: s += 8; r.append("cost-to-income {:.0%} (high)".format(p["efficiency"]))
+    if p["lossYears"] == 0 and p["totalYears"] >= 3:
+        s += 50; r.append("profitable every year on record")
+    pillars["Quality"] = min(100, s); reasons["Quality"] = r
+    s, r = 0, []
+    if p["revCagr"] is not None:
+        if p["revCagr"] >= 0.12: s += 50; r.append("revenue compounding {:.0%}/yr".format(p["revCagr"]))
+        elif p["revCagr"] >= 0.05: s += 35; r.append("revenue growing {:.0%}/yr".format(p["revCagr"]))
+        elif p["revCagr"] >= 0: s += 18
+        else: r.append("revenue shrinking")
+    if p["equityCagr"] is not None and p["equityCagr"] >= 0.08:
+        s += 50; r.append("book value compounding {:.0%}/yr".format(p["equityCagr"]))
+    elif p["equityCagr"] is not None and p["equityCagr"] >= 0.03:
+        s += 30
+    pillars["Growth"] = min(100, s); reasons["Growth"] = r
+    return pillars, reasons
+
+
+def classify_financial(p, pillars, ctype):
+    stamps = []
+    weights = {"Returns": 0.30, "Capital strength": 0.28, "Quality": 0.24, "Growth": 0.18}
+    overall = round(sum(pillars.get(k, 0) * w for k, w in weights.items()))
+    ret = pillars.get("Returns", 0); cap = pillars.get("Capital strength", 0)
+    qual = pillars.get("Quality", 0); grow = pillars.get("Growth", 0)
+    structural = p["structurallyWeak"]; collapsing = p["niDeteriorating"]
+    thin_cap = (ctype == "bank" and p["equityToAssets"] is not None and p["equityToAssets"] < 0.06)
+    grenade = structural or (thin_cap and (p["roe"] is None or p["roe"] < 0))
+    if grenade:
+        stamps.append(("Grenade", "Lossmaking across most of its history and/or dangerously thin capital. Avoid."))
+    if collapsing and not grenade:
+        stamps.append(("Falling knife", "Profit fell away sharply in the latest year - understand why before buying."))
+    if ctype == "bank" and cap >= 70 and ret >= 45:
+        stamps.append(("Fortress financial", "Well capitalised and earning good returns - a sturdy compounder among financials."))
+    if ret >= 60 and qual >= 60:
+        stamps.append(("High-return franchise", "Earns above-average returns efficiently and consistently."))
+    if grow >= 60 and ret >= 45:
+        stamps.append(("Compounder", "Growing the book and earnings while keeping returns up."))
+    if (p["roe"] is not None and 0 < p["roe"] < 0.07) and not grenade:
+        stamps.append(("Low-return financial", "Returns on equity are below the cost of capital most investors require - capital is not working hard here."))
+    if not grenade and not collapsing and ret >= 45 and cap >= 50 and not stamps:
+        stamps.append(("Steady financial", "Reliably profitable and reasonably capitalised, without standout growth."))
+    if not stamps:
+        stamps.append(("Mixed picture", "Signals are mixed - read the detail below."))
+    if grenade: tier = "Avoid"
+    elif collapsing: tier = "Caution - deteriorating"
+    elif overall >= 70: tier = "High quality"
+    elif overall >= 52: tier = "Solid"
+    elif overall >= 38: tier = "Mixed / watch"
+    else: tier = "Weak"
+    seen = set(); uniq = []
+    for s in stamps:
+        if s[0] not in seen:
+            seen.add(s[0]); uniq.append(s)
+    return {"overall": overall, "tier": tier, "stamps": uniq}
+
+
+
+_TIER_COLOUR = {
+    "High quality": "#1b7f3b", "Solid": "#3a7d44",
+    "Mixed / watch": "#b8860b", "Weak": "#b04a2f",
+    "Caution - deteriorating": "#c0392b", "Avoid": "#922b21",
+}
+
+
+def assess_business(income, balance, cashflow):
+    """Top-level: returns a dict describing the business classification."""
+    ctype = detect_company_type(income, balance)
+    if ctype in ("bank", "insurer", "holding", "reit"):
+        p = build_financial_panel(income, balance, cashflow)
+        pillars, reasons = score_financial(p, ctype)
+        verdict = classify_financial(p, pillars, ctype)
+        family = "financial"
+    else:
+        p = build_metric_panel(income, balance, cashflow)
+        pillars, reasons = score_industrial(p)
+        verdict = classify_business(p, pillars, ctype)
+        family = "industrial"
+    risks = detect_risks(p, ctype)
+    refi = _refinancing_read(p, "") if family == "industrial" else None
+    return {"type": ctype, "family": family, "panel": p, "pillars": pillars,
+            "reasons": reasons, "verdict": verdict, "risks": risks, "refi": refi}
+
+
+_TYPE_LABEL = {
+    "industrial": "Operating company", "bank": "Bank / lender",
+    "insurer": "Insurer", "reit": "Property / REIT",
+    "holding": "Holding / investment company", "unknown": "Unclassified",
+}
+
+
+def render_verdict(income, balance, cashflow, currency, company_name):
+    if income is None or balance is None:
+        st.info("Not enough statement data to classify this business.")
+        return
+    a = assess_business(income, balance, cashflow)
+    v = a["verdict"]; p = a["panel"]
+    colour = _TIER_COLOUR.get(v["tier"], "#444")
+
+    stamp_names = " &nbsp;&middot;&nbsp; ".join(s[0] for s in v["stamps"])
+    st.markdown(
+        "<div style='border-left:8px solid " + colour + ";background:#0e1117;"
+        "padding:14px 18px;border-radius:6px;margin-bottom:6px'>"
+        "<div style='font-size:0.85rem;color:#9aa0a6;text-transform:uppercase;"
+        "letter-spacing:.05em'>" + _TYPE_LABEL.get(a["type"], a["type"]) +
+        " &nbsp;|&nbsp; overall score " + str(v["overall"]) + "/100</div>"
+        "<div style='font-size:1.6rem;font-weight:700;color:" + colour + "'>" + v["tier"] + "</div>"
+        "<div style='font-size:1.05rem;color:#e8eaed;margin-top:2px'>" + stamp_names + "</div>"
+        "</div>", unsafe_allow_html=True)
+
+    if p.get("dataConfidence", 1.0) < 0.7:
+        st.warning("Data quality is low for this company (" + "; ".join(p.get("dqFlags", [])) +
+                   "). Treat the classification as indicative only.")
+
+    for name, blurb in v["stamps"]:
+        st.markdown("**" + name + ".** " + blurb)
+
+    st.divider()
+
+    st.markdown("#### How the score breaks down")
+    cols = st.columns(len(a["pillars"]))
+    for col, (k, val) in zip(cols, a["pillars"].items()):
+        col.metric(k, str(int(round(val))) + "/100")
+    for k, rs in a["reasons"].items():
+        if rs:
+            st.markdown("**" + k + "** &mdash; " + "; ".join(rs) + ".")
+
+    st.divider()
+
+    refi = a["refi"]
+    if refi is not None:
+        st.markdown("#### Debt & refinancing risk")
+        rc = {"none": "#1b7f3b", "low": "#1b7f3b", "moderate": "#b8860b",
+              "high": "#c0392b", "unknown": "#666"}.get(refi["level"], "#666")
+        st.markdown("<span style='color:" + rc + ";font-weight:600'>"
+                    "Near-term refinancing risk: " + refi["level"].upper() + "</span>",
+                    unsafe_allow_html=True)
+        st.markdown(refi["message"])
+        if refi["breakdown"]:
+            due_tbl = {}
+            for nm, amt in refi["breakdown"]:
+                due_tbl[nm] = fmt_money_compact(amt, currency)
+            due_tbl["Total due within ~1 year"] = fmt_money_compact(refi["due"], currency)
+            due_tbl["Cash on hand"] = fmt_money_compact(refi["cash"], currency)
+            due_tbl["Free cash flow (latest yr)"] = fmt_money_compact(refi["fcf"], currency)
+            st.table(pd.Series(due_tbl, name="Amount").to_frame())
+        extra = []
+        if refi["netDebtToEbitda"] is not None and refi["netDebtToEbitda"] > -90:
+            extra.append("Net debt is {:.1f}x EBITDA.".format(refi["netDebtToEbitda"]))
+        elif refi["netDebtToEbitda"] is not None:
+            extra.append("The company holds more cash than debt (net cash).")
+        if refi["intCover"] is not None and refi["intCover"] != float("inf"):
+            extra.append("Operating profit covers interest {:.1f}x.".format(refi["intCover"]))
+        if refi["longTermDebt"] or refi["longTermLeases"]:
+            lt = (refi["longTermDebt"] or 0) + (refi["longTermLeases"] or 0)
+            extra.append("Longer-dated debt & leases total " + fmt_money_compact(lt, currency) + ".")
+        if extra:
+            st.markdown(" ".join(extra))
+        st.caption("This is a near-term refinancing read built from the current "
+                   "portion of debt and leases the feed reports. A full year-by-year "
+                   "maturity ladder is only in the audited notes and is not modelled here.")
+        st.divider()
+
+    st.markdown("#### Risks to watch")
+    for title, body in a["risks"]:
+        st.markdown("**" + title + ".** " + body)
+
+    st.caption("All classifications are derived only from reported figures versus "
+               "stockanalysis.com data - they are a disciplined reading of the numbers, "
+               "not investment advice.")
+
+
 # 4. USER INTERFACE
 # ---------------------------------------------------------------------------
 
@@ -1391,7 +2051,7 @@ def main():
         )
         return
 
-    tabs = st.tabs(["Overview", "Income Statement", "Balance Sheet",
+    tabs = st.tabs(["Overview", "Verdict", "Income Statement", "Balance Sheet",
                     "Cash Flow", "Decomposition", "Ratios", "Valuation"])
 
     # ---- Overview ---------------------------------------------------------
@@ -1447,11 +2107,20 @@ def main():
                 cols[i].metric(abbrev.get(r["name"], r["name"]), f"{r['value']:.1f}",
                                help=f"{r['name']} — {r.get('desc', '')}")
 
+    # ---- Verdict ----------------------------------------------------------
+    with tabs[1]:
+        st.subheader(f"{companies.get(ticker, ticker)} \u2014 the verdict")
+        st.caption("A disciplined, financials-only reading of the business: "
+                   "what kind of company it is, how it scores, what it is, and "
+                   "the risks to watch. Reflects the latest reported year.")
+        render_verdict(income, balance, cashflow, currency,
+                       companies.get(ticker, ticker))
+
     # ---- One drill-down tab per statement --------------------------------
     statement_tabs = {
-        "Income Statement": (tabs[1], income, inc_agg),
-        "Balance Sheet": (tabs[2], balance, bal_agg),
-        "Cash Flow": (tabs[3], cashflow, cf_agg),
+        "Income Statement": (tabs[2], income, inc_agg),
+        "Balance Sheet": (tabs[3], balance, bal_agg),
+        "Cash Flow": (tabs[4], cashflow, cf_agg),
     }
     for sname, (tab, df, aggs) in statement_tabs.items():
         with tab:
@@ -1483,7 +2152,7 @@ def main():
                 st.dataframe(df.loc[[item]].style.format("{:,.0f}"))
 
     # ---- Decomposition ----------------------------------------------------
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("Decomposition")
         st.caption(
             "For a composite metric, see how it changed over the available years "
@@ -1555,7 +2224,7 @@ def main():
                     st.markdown(decomposition_narrative(d, currency, income, balance))
 
     # ---- Ratios -----------------------------------------------------------
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("Financial ratios")
         ratios = compute_ratios(income, balance, cashflow)
         if not ratios:
@@ -1581,7 +2250,7 @@ def main():
                 use_container_width=True)
 
     # ---- Valuation --------------------------------------------------------
-    with tabs[6]:
+    with tabs[7]:
         st.subheader("Valuation (estimate)")
         st.caption(
             "A simple 2-stage discounted-cash-flow model with an earnings-multiple "
