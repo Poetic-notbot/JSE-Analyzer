@@ -1418,6 +1418,45 @@ def detect_company_type(income, balance):
         return "holding"
     return "industrial"
 
+def _last_complete_col(df, threshold=5):
+    """Return the label of the last 'complete' fiscal column. Some feeds tack on
+    an interim/partial most-recent period (e.g. a 9-month FY2026) whose rows are
+    largely null; including it would corrupt 'latest year' metrics, so we detect
+    a markedly sparser trailing column and step back to the last full one."""
+    if df is None or df.shape[1] == 0:
+        return None
+    cols = list(df.columns)
+    i = len(cols) - 1
+    while i >= 1:
+        last_nulls = int(df.iloc[:, i].isna().sum())
+        prev_nulls = int(df.iloc[:, i - 1].isna().sum())
+        if last_nulls >= prev_nulls + threshold:
+            i -= 1
+        else:
+            break
+    return cols[i]
+
+def _align_to_complete_years(income, balance, cashflow):
+    """Trim all three statements to the last fiscal year that is complete across
+    the board, so 'latest' metrics use a true full-year figure."""
+    refs = []
+    for d in (balance, income):
+        if d is not None and d.shape[1]:
+            lcc = _last_complete_col(d)
+            if lcc is not None:
+                refs.append(str(lcc))
+    if not refs:
+        return income, balance, cashflow
+    ref = min(refs)
+    out = []
+    for d in (income, balance, cashflow):
+        if d is None:
+            out.append(None)
+            continue
+        keep = [c for c in d.columns if str(c) <= ref]
+        out.append(d[keep] if keep else d)
+    return out[0], out[1], out[2]
+
 def build_metric_panel(income, balance, cashflow, ctype):
     """One panel of financials-derived metrics shared by every scorer.
     Keys are stable; scorers read what they need for their business type."""
@@ -1986,6 +2025,7 @@ _TYPE_LABEL = {
 
 def assess_business(income, balance, cashflow):
     """Top-level assessment: detect type, score the right way, stamp and flag."""
+    income, balance, cashflow = _align_to_complete_years(income, balance, cashflow)
     ctype = detect_company_type(income, balance)
     p = build_metric_panel(income, balance, cashflow, ctype)
 
