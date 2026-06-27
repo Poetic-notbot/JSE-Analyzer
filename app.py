@@ -648,6 +648,12 @@ def decomposition_children(df, parent, aggregates, cascade=False):
         if any(abs(sv) > abs(pv) + 1e-6 for sv, pv in shared):
             return False
         if parent_mag is not None:
+            # If the components gathered so far already account for the whole
+            # parent, this subtotal cannot be part of it - we have crossed into
+            # the next section (e.g. 'Total Liabilities' sitting just above the
+            # equity block on a near-debt-free balance sheet).
+            if running >= parent_mag * 0.97 - 1e-6:
+                return False
             sv = abs(float(s.iloc[-1]))
             if running + sv > parent_mag * 1.05 + 1e-6:
                 return False
