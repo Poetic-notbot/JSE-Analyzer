@@ -435,7 +435,11 @@ def invested_capital(balance):
     common = debt.index.intersection(equity.index).intersection(cash.index)
     if len(common) == 0:
         return pd.Series(dtype=float)
-    return (debt[common] + equity[common] - cash[common]).dropna()
+    ic = (debt[common] + equity[common] - cash[common]).dropna()
+    # Guard against a non-positive invested-capital base. Net-cash companies
+    # (cash > debt + equity) can drive the denominator <= 0, which otherwise
+    # produces nonsensical ROIC/CROIC values (e.g. -578% for Carreras).
+    return ic.where(ic > 0).dropna()
 
 
 def compute_ratios(income, balance, cashflow):
@@ -452,7 +456,9 @@ def compute_ratios(income, balance, cashflow):
     ni = latest(income, "Net Income") or latest(income, "Net Income Common")
     ebit = latest(income, "Operating Income") or latest(income, "EBIT")
     assets = latest(balance, "Total Assets")
-    equity = latest(balance, "Shareholders' Equity") or latest(balance, "Total Equity")
+    equity = (latest(balance, "Total Common Equity")
+              or latest(balance, "Shareholders' Equity")
+              or latest(balance, "Total Equity"))
     debt = latest(balance, "Total Debt")
     ocf = latest(cashflow, "Operating Cash Flow") if cashflow is not None else None
 
@@ -505,7 +511,7 @@ def ratio_timeseries(income, balance, cashflow):
     ni = series_of(income, "Net Income", "Net Income Common")
     ebit = series_of(income, "Operating Income", "EBIT")
     assets = series_of(balance, "Total Assets")
-    equity = series_of(balance, "Shareholders' Equity", "Total Equity")
+    equity = series_of(balance, "Total Common Equity", "Shareholders' Equity", "Total Equity")
     debt = series_of(balance, "Total Debt")
     ocf = series_of(cashflow, "Operating Cash Flow")
 
@@ -572,7 +578,7 @@ def extra_ratio_timeseries(income, balance, cashflow):
         "Operating income as a % of invested capital")
     add("Current ratio", ratio(cur_assets, cur_liab), "x",
         "Current assets vs current liabilities")
-    add("Interest coverage", ratio(ebit, interest), "x",
+    add("Interest coverage", ratio(ebit, interest.abs()), "x",
         "Operating income vs interest expense")
     add("Gross margin", ratio(gross, rev, 100), "%",
         "Gross profit per dollar of sales")
@@ -608,7 +614,7 @@ KNOWN_SUBTOTALS = {
 }
 
 
-def decomposition_children(df, parent, aggregates):
+def decomposition_children(df, parent, aggregates, cascade=False):
     """
     Components of a parent subtotal, derived from the statement's own ordering
     and the `aggregates` set (an extension of components_of that handles nested
@@ -621,18 +627,67 @@ def decomposition_children(df, parent, aggregates):
         return []
     order = list(df.index)
     idx = order.index(parent)
+    parent_s = clean_series(df, parent)
+    # Magnitude of the parent on its latest reported year, used to stop the walk
+    # before it crosses into a neighbouring section (see _fits below).
+    parent_mag = abs(float(parent_s.iloc[-1])) if len(parent_s) else None
+
+    def _fits(name, running):
+        """Is this nested subtotal genuinely PART of the parent?
+
+        A real component fits inside the parent: it never exceeds the parent on
+        any shared year, and adding it to what we've already collected does not
+        overshoot the parent. This stops the upward walk at a section boundary
+        (e.g. decomposing 'Total Current Liabilities' must not reach up into the
+        asset rows and grab 'Total Current Assets'/'Total Assets').
+        """
+        s = clean_series(df, name)
+        shared = [(s[y], parent_s[y]) for y in s.index if y in parent_s.index]
+        if not shared:
+            return False
+        if any(abs(sv) > abs(pv) + 1e-6 for sv, pv in shared):
+            return False
+        if parent_mag is not None:
+            # If the components gathered so far already account for the whole
+            # parent, this subtotal cannot be part of it - we have crossed into
+            # the next section (e.g. 'Total Liabilities' sitting just above the
+            # equity block on a near-debt-free balance sheet).
+            if running >= parent_mag * 0.97 - 1e-6:
+                return False
+            sv = abs(float(s.iloc[-1]))
+            if running + sv > parent_mag * 1.05 + 1e-6:
+                return False
+        return True
+
     children = []
+    running = 0.0  # accumulated magnitude of collected components (latest year)
     i = idx - 1
     while i >= 0:
         name = order[i]
+
+        def _mag(n):
+            s = clean_series(df, n)
+            return abs(float(s.iloc[-1])) if len(s) else 0.0
+
         if name in aggregates:
-            children.append(name)                # nested subtotal as one block
+            if cascade:
+                # Cascade (e.g. income statement): this nested subtotal is the
+                # running base that already contains everything above it, so it
+                # alone partitions the rest. Include it and stop, instead of
+                # summing the cumulative subtotals above it (double-counting).
+                children.append(name)
+                break
+            if not _fits(name, running):
+                break                             # reached a different section
+            children.append(name)                 # nested subtotal as one block
+            running += _mag(name)
             j = i - 1
             while j >= 0 and order[j] not in aggregates:
                 j -= 1                            # skip the rows it rolls up
             i = j
         else:
             children.append(name)
+            running += _mag(name)
             i -= 1
     return list(reversed(children))
 
@@ -652,9 +707,10 @@ def decomposable_parents(df, aggregates, statement):
         return [], set()
     known = {n for n in KNOWN_SUBTOTALS.get(statement, []) if n in df.index}
     eff_aggs = set(aggregates) | known
+    cascade = statement == "Income Statement"
     parents = [name for name in df.index                       # statement order
                if name in eff_aggs
-               and len(decomposition_children(df, name, eff_aggs)) >= 2]
+               and len(decomposition_children(df, name, eff_aggs, cascade)) >= 2]
     return parents, eff_aggs
 
 
@@ -820,7 +876,7 @@ def _component_signs(df, parent, names):
     return {n: signs.get(n, 1) for n in names}
 
 
-def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
+def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12, cascade=False):
     """
     Decompose a parent subtotal's change over its full available window into
     component contributions, using only the company's reported data.
@@ -840,7 +896,7 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12):
     parent_delta = pN - p0
 
     raw = []
-    for name in decomposition_children(df, parent, aggregates):
+    for name in decomposition_children(df, parent, aggregates, cascade):
         cs = clean_series(df, name)
         first = float(cs[y0]) if y0 in cs.index else None
         last = float(cs[yN]) if yN in cs.index else None
@@ -1453,7 +1509,8 @@ def main():
             else:
                 parent = st.selectbox("Parent metric", parents,
                                       key=f"decomp_parent::{sname}")
-                d = decompose(ddf, parent, eff_aggs)
+                d = decompose(ddf, parent, eff_aggs,
+                              cascade=sname == "Income Statement")
                 if d is None:
                     st.info("Not enough years of data to decompose this metric.")
                 else:
