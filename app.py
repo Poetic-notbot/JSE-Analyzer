@@ -1693,14 +1693,14 @@ def score_industrial(p):
     """Five pillars for an operating (industrial / consumer / services) business."""
     P = {}
     parts = []
-    s = _score_from(p["opMargin"], 0.02, 0.22);  parts.append(s) if s is not None else None
-    s = _score_from(p["roe"], 0.05, 0.25);        parts.append(s) if s is not None else None
-    s = _score_from(p["netMargin"], 0.01, 0.15);  parts.append(s) if s is not None else None
+    s = _score_from(p["opMargin"], 0.02, 0.22);  _ = parts.append(s) if s is not None else None
+    s = _score_from(p["roe"], 0.05, 0.25);        _ = parts.append(s) if s is not None else None
+    s = _score_from(p["netMargin"], 0.01, 0.15);  _ = parts.append(s) if s is not None else None
     P["Profitability"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["fcfMargin"], 0.0, 0.15);      parts.append(s) if s is not None else None
-    s = _score_from(p["cashConversion"], 0.4, 1.1);  parts.append(s) if s is not None else None
+    s = _score_from(p["fcfMargin"], 0.0, 0.15);      _ = parts.append(s) if s is not None else None
+    s = _score_from(p["cashConversion"], 0.4, 1.1);  _ = parts.append(s) if s is not None else None
     if p["fcfPositive"]:
         parts.append(80.0)
     else:
@@ -1721,13 +1721,13 @@ def score_industrial(p):
     P["Balance sheet"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["revCagr"], 0.0, 0.15);  parts.append(s) if s is not None else None
-    s = _score_from(p["niCagr"], 0.0, 0.18);   parts.append(s) if s is not None else None
+    s = _score_from(p["revCagr"], 0.0, 0.15);  _ = parts.append(s) if s is not None else None
+    s = _score_from(p["niCagr"], 0.0, 0.18);   _ = parts.append(s) if s is not None else None
     P["Growth"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["roe"], 0.10, 0.28);          parts.append(s) if s is not None else None
-    s = _score_from(p["grossMargin"], 0.15, 0.45);  parts.append(s) if s is not None else None
+    s = _score_from(p["roe"], 0.10, 0.28);          _ = parts.append(s) if s is not None else None
+    s = _score_from(p["grossMargin"], 0.15, 0.45);  _ = parts.append(s) if s is not None else None
     if p["opMarginStart"] is not None and p["opMarginEnd"] is not None:
         parts.append(75.0 if p["opMarginEnd"] >= p["opMarginStart"] else 40.0)
     P["Moat"] = round(sum(parts)/len(parts)) if parts else 50
@@ -1745,11 +1745,11 @@ def score_financial(p, ctype):
     P["Returns"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["equityToAssets"], 0.05, 0.12); parts.append(s) if s is not None else None
+    s = _score_from(p["equityToAssets"], 0.05, 0.12); _ = parts.append(s) if s is not None else None
     P["Capital strength"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["netMargin"], 0.10, 0.30); parts.append(s) if s is not None else None
+    s = _score_from(p["netMargin"], 0.10, 0.30); _ = parts.append(s) if s is not None else None
     if p["lossYears"] == 0 and p["totalYears"] >= 3:
         parts.append(80.0)
     elif p["lossYears"] > 0:
@@ -1757,8 +1757,8 @@ def score_financial(p, ctype):
     P["Quality"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["niCagr"], -0.05, 0.15);     parts.append(s) if s is not None else None
-    s = _score_from(p["equityCagr"], -0.02, 0.12); parts.append(s) if s is not None else None
+    s = _score_from(p["niCagr"], -0.05, 0.15);     _ = parts.append(s) if s is not None else None
+    s = _score_from(p["equityCagr"], -0.02, 0.12); _ = parts.append(s) if s is not None else None
     P["Growth"] = round(sum(parts)/len(parts)) if parts else 50
     if p["lossYears"] == 0 and p["totalYears"] >= 3:
         P["Growth"] = max(P["Growth"], 40)
@@ -1769,12 +1769,12 @@ def score_insurer(p):
     quality (stability), and growth."""
     P = {}
     parts = []
-    s = _score_from(p["roe"], 0.08, 0.20);   parts.append(s) if s is not None else None
-    s = _score_from(p["netMargin"], 0.05, 0.20); parts.append(s) if s is not None else None
+    s = _score_from(p["roe"], 0.08, 0.20);   _ = parts.append(s) if s is not None else None
+    s = _score_from(p["netMargin"], 0.05, 0.20); _ = parts.append(s) if s is not None else None
     P["Earnings power"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["equityToAssets"], 0.10, 0.25); parts.append(s) if s is not None else None
+    s = _score_from(p["equityToAssets"], 0.10, 0.25); _ = parts.append(s) if s is not None else None
     if p["floatToEquity"] is not None:
         parts.append(_score_from(-p["floatToEquity"], -4.0, -0.5))
     P["Capital adequacy"] = round(sum(parts)/len(parts)) if parts else 50
@@ -1784,12 +1784,12 @@ def score_insurer(p):
         parts.append(82.0)
     elif p["lossYears"] > 0:
         parts.append(30.0)
-    s = _score_from(p["roa"], 0.01, 0.035); parts.append(s) if s is not None else None
+    s = _score_from(p["roa"], 0.01, 0.035); _ = parts.append(s) if s is not None else None
     P["Underwriting quality"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["niCagr"], -0.05, 0.15);     parts.append(s) if s is not None else None
-    s = _score_from(p["equityCagr"], -0.02, 0.12); parts.append(s) if s is not None else None
+    s = _score_from(p["niCagr"], -0.05, 0.15);     _ = parts.append(s) if s is not None else None
+    s = _score_from(p["equityCagr"], -0.02, 0.12); _ = parts.append(s) if s is not None else None
     P["Growth"] = round(sum(parts)/len(parts)) if parts else 50
     if p["lossYears"] == 0 and p["totalYears"] >= 3:
         P["Growth"] = max(P["Growth"], 45)
@@ -1800,8 +1800,8 @@ def score_reit(p):
     leverage, balance-sheet conservatism, and growth."""
     P = {}
     parts = []
-    s = _score_from(p["roe"], 0.04, 0.12);    parts.append(s) if s is not None else None
-    s = _score_from(p["netMargin"], 0.10, 0.40); parts.append(s) if s is not None else None
+    s = _score_from(p["roe"], 0.04, 0.12);    _ = parts.append(s) if s is not None else None
+    s = _score_from(p["netMargin"], 0.10, 0.40); _ = parts.append(s) if s is not None else None
     P["Rental earnings power"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
@@ -1814,7 +1814,7 @@ def score_reit(p):
     P["Leverage & coverage"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["equityToAssets"], 0.30, 0.65); parts.append(s) if s is not None else None
+    s = _score_from(p["equityToAssets"], 0.30, 0.65); _ = parts.append(s) if s is not None else None
     if p["lossYears"] == 0 and p["totalYears"] >= 3:
         parts.append(78.0)
     elif p["lossYears"] > 0:
@@ -1822,8 +1822,8 @@ def score_reit(p):
     P["Balance sheet"] = round(sum(parts)/len(parts)) if parts else 50
 
     parts = []
-    s = _score_from(p["revCagr"], 0.0, 0.12); parts.append(s) if s is not None else None
-    s = _score_from(p["niCagr"], 0.0, 0.12);  parts.append(s) if s is not None else None
+    s = _score_from(p["revCagr"], 0.0, 0.12); _ = parts.append(s) if s is not None else None
+    s = _score_from(p["niCagr"], 0.0, 0.12);  _ = parts.append(s) if s is not None else None
     P["Growth"] = round(sum(parts)/len(parts)) if parts else 50
     return P
 
@@ -2114,7 +2114,7 @@ def render_verdict(income, balance, cashflow, currency, company_name):
     st.markdown("#### Scorecard")
     pc = st.columns(len(a["pillars"]))
     for (name, val), col in zip(a["pillars"].items(), pc):
-        col.metric(name, str(val))
+        _ = col.metric(name, str(val))
     st.caption("Pillars are weighted for a " + a["typeLabel"].lower() + " to reach the headline score.")
     st.divider()
 
