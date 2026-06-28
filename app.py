@@ -257,6 +257,50 @@ def get_statement(ticker, statement):
     return _apply_fx(ticker, df, aggregates, currency)
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_ratios(ticker):
+    """Current (TTM) valuation ratios from stockanalysis.com's ratios feed.
+    Index 0 of each per-period array is the TTM/most-recent column.
+    Returns {} on any failure (callers must degrade gracefully)."""
+    url = f"{BASE}/quote/jmse/{ticker}/financials/ratios/__data.json"
+    raw = _fetch(url)
+    if raw is None:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    node = None
+    for n in obj.get("nodes", []):
+        if isinstance(n, dict) and isinstance(n.get("data"), list):
+            rr = _resolve(n["data"])
+            if isinstance(rr, dict) and "marketcap" in rr and "evebit" in rr:
+                node = rr
+                break
+    if node is None:
+        return {}
+
+    def first(key):
+        v = node.get(key)
+        if isinstance(v, list) and v and isinstance(v[0], (int, float)):
+            return float(v[0])
+        return None
+
+    return {
+        "marketcap":     first("marketcap"),
+        "ev":            first("ev"),
+        "pe":            first("pe"),
+        "pb":            first("pb"),
+        "ptbv":          first("ptbvRatio"),
+        "evEbit":        first("evebit"),
+        "evEbitda":      first("evebitda"),
+        "earningsYield": first("earningsyield"),
+        "dividendYield": first("dividendyield"),
+        "roicSite":      first("roic"),
+        "currentRatio":  first("currentratio"),
+    }
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def get_companies():
     """Return {ticker: name} for all JSE companies, with a fallback list."""
@@ -1253,6 +1297,46 @@ def estimate_valuation(income, balance, cashflow, shares, price,
     return out
 
 
+def value_profile(p, ratios):
+    """Fundamentals panel p + TTM site ratios -> valuation anchors + clues."""
+    v = dict(ratios) if ratios else {}
+    mcap = v.get("marketcap")
+
+    v["fcfYield"]  = _safe_div(p.get("fcf"), mcap)
+    v["priceToNi"] = _safe_div(mcap, p.get("ni"))                 # years of net income
+    total_liab = (p.get("assets") or 0) - (p.get("equity") or 0)
+    ncav = (p.get("curAssets") or 0) - total_liab                 # Graham net-net
+    v["ncav"] = ncav
+    v["priceToNcav"] = _safe_div(mcap, ncav) if (ncav and ncav > 0) else None
+
+    healthy = (p.get("fcfPositive") and p.get("lossYears", 9) <= 1
+               and (p.get("netDebtToEbit") is None or p.get("netDebtToEbit") < 3))
+
+    clues = []
+    g = lambda t: clues.append(("good", t))
+    c = lambda t: clues.append(("caution", t))
+    if v.get("priceToNcav") is not None and v["priceToNcav"] <= 1.0 and healthy:
+        g("Market value is at or below net current assets — fixed assets and earnings "
+          "power are effectively in for free (a Graham net-net).")
+    if v.get("priceToNi") is not None and v["priceToNi"] <= 6 and healthy:
+        g(f"Priced at about {v['priceToNi']:.1f} years of current net income while "
+          "fundamentals look healthy.")
+    if v.get("pb") is not None and v["pb"] < 1.0 and healthy:
+        g(f"Trading at {v['pb']:.2f}x book value.")
+    if v.get("evEbit") is not None and v["evEbit"] <= 8:
+        g(f"EV/EBIT of {v['evEbit']:.1f}x — cheap on a leverage-neutral basis.")
+    if v.get("fcfYield") is not None and v["fcfYield"] >= 0.10 and (p.get("netDebtToEbit") or 0) < 2:
+        g(f"Free-cash-flow yield of {v['fcfYield']*100:.0f}% with modest leverage.")
+    if v.get("dividendYield") and v["dividendYield"] >= 0.06 and healthy:
+        g(f"Dividend yield of {v['dividendYield']*100:.1f}% covered by a healthy business.")
+    if v.get("priceToNi") is not None and v["priceToNi"] > 25:
+        c(f"Priced at ~{v['priceToNi']:.0f} years of earnings — much growth assumed.")
+    if v.get("evEbit") is not None and v["evEbit"] > 20:
+        c(f"EV/EBIT of {v['evEbit']:.0f}x is demanding.")
+    v["clues"] = clues
+    return v
+
+
 # ---------------------------------------------------------------------------
 # 3. CHARTS
 # ---------------------------------------------------------------------------
@@ -1578,6 +1662,20 @@ def build_metric_panel(income, balance, cashflow, ctype):
     eq = p["equity"]
     p["roe"] = _safe_div(p["ni"], eq) if eq and eq > 0 else None
     p["roa"] = _safe_div(p["ni"], p["assets"]) if p["assets"] else None
+
+    # --- after-tax ROIC (NOPAT / invested capital) --------------------------
+    pretax = _pick(I, "Pretax Income", "Pre-Tax Income", "EBT", "Earnings Before Tax")
+    taxexp = _pick(I, "Income Tax", "Income Tax Expense", "Provision for Income Taxes")
+    _ptx, _tx = _last(pretax), _last(taxexp)
+    eff = _safe_div(_tx, _ptx) if (_ptx and _ptx > 0) else None
+    if eff is None or eff < 0 or eff > 0.40:
+        eff = 0.25                                   # Jamaican statutory fallback
+    p["effTaxRate"] = eff
+    p["nopat"] = ebitV * (1 - eff) if ebitV is not None else None
+    _ic = (p["debt"] or 0.0) + (eq or 0.0) - (p["cash"] or 0.0)
+    p["investedCapital"] = _ic if _ic > 0 else None
+    p["roic"] = _safe_div(p["nopat"], p["investedCapital"]) if p["investedCapital"] else None
+    p["netDebtToEbit"] = _safe_div(p["debt"] - p["cash"], ebitV) if (ebitV and ebitV > 0) else None
 
     p["netDebt"] = p["debt"] - p["cash"]
     p["debtToEquity"]   = _safe_div(p["debt"], eq) if eq and eq > 0 else None
@@ -2211,6 +2309,7 @@ def build_universe():
     """Score every JSE company once and return a tidy comparison table.
     Reuses assess_business() so scores/stamps match the single-company view."""
     rows = []
+    panel_for = {}
     companies = get_companies()
     for tkr, name in companies.items():
         try:
@@ -2221,6 +2320,7 @@ def build_universe():
                 continue
             a = assess_business(income, balance, cash)
             p = a["panel"]
+            panel_for[tkr] = p
             fxc = _FX_CONTEXT.get(tkr, {})
             def pct(x):
                 return round(x * 100, 1) if isinstance(x, (int, float)) else None
@@ -2237,13 +2337,17 @@ def build_universe():
                 "Net margin %": pct(p.get("netMargin")),
                 "FCF margin %": pct(p.get("fcfMargin")),
                 "Rev CAGR %": pct(p.get("revCagr")),
-                "Net debt/EBITDA": num(p.get("netDebtToEbitda")),
+                "ROIC %": pct(p.get("roic")),
+                "ROA %": pct(p.get("roa")),
+                "Net debt/EBIT": num(p.get("netDebtToEbit")),
+                "Equity/assets %": pct(p.get("equityToAssets")),
                 "Interest cover": num(p.get("intCover")),
                 "Reported ccy": fxc.get("reported", "JMD"),
                 "Stamps": ", ".join(s.get("name", "") for s in a.get("stamps", [])),
             })
         except Exception:
             continue
+    st.session_state["panel_for"] = panel_for
     return pd.DataFrame(rows)
 
 def render_compare():
@@ -2265,7 +2369,7 @@ def render_compare():
         types = c2.multiselect("Industry / type", sorted(uni["Type"].unique()))
         sort_by = c3.selectbox("Rank by", [
             "Score", "ROE %", "Op margin %", "Net margin %", "FCF margin %",
-            "Rev CAGR %", "Interest cover", "Net debt/EBITDA (low to high)",
+            "Rev CAGR %", "Interest cover", "Net debt/EBIT (low to high)",
         ])
 
         view = uni.copy()
@@ -2286,13 +2390,99 @@ def render_compare():
     with tab_h2h:
         options = [f"{r.Ticker} \u2014 {r.Company}" for r in uni.itertuples()]
         picks = st.multiselect("Pick any 2 or more companies to compare", options)
-        if len(picks) >= 2:
-            chosen = [p.split(" \u2014 ")[0] for p in picks]
-            sub = uni[uni["Ticker"].isin(chosen)]
-            st.dataframe(sub.set_index("Ticker").T, use_container_width=True)
-            st.bar_chart(sub.set_index("Company")["Score"])
-        else:
+        if len(picks) < 2:
             st.info("Choose at least two companies to see them side by side.")
+            return
+        chosen = [pk.split(" \u2014 ")[0] for pk in picks]
+        sub = uni[uni["Ticker"].isin(chosen)].set_index("Ticker")
+        panel_for = st.session_state.get("panel_for", {})
+
+        types = set(sub["Type"])
+        is_fin  = bool(types & {"Bank / diversified financial", "Insurer",
+                                "Holding / investment company"})
+        is_reit = "Property / REIT" in types
+        OPERATING = [("ROIC %", False), ("ROE %", False), ("Op margin %", False),
+                     ("Net margin %", False), ("FCF margin %", False), ("Rev CAGR %", False),
+                     ("Net debt/EBIT", True), ("Interest cover", False)]
+        FINANCIAL = [("ROE %", False), ("ROA %", False), ("Net margin %", False),
+                     ("Rev CAGR %", False), ("Equity/assets %", False), ("Interest cover", False)]
+        REITY     = [("ROA %", False), ("Op margin %", False), ("FCF margin %", False),
+                     ("Rev CAGR %", False), ("Net debt/EBIT", True), ("Equity/assets %", False)]
+        metric_set = REITY if (is_reit and not is_fin) else (FINANCIAL if is_fin else OPERATING)
+
+        if len(types) > 1:
+            st.warning("You're comparing different business types "
+                       f"({', '.join(sorted(types))}). Margins, ROIC and leverage aren't "
+                       "directly comparable across them — read each metric in context.")
+
+        # valuation profiles
+        vprof = {t: value_profile(panel_for.get(t, {}), get_ratios(t)) for t in chosen}
+        VAL = [("EV/EBIT", "evEbit", True), ("P/B", "pb", True),
+               ("FCF yield %", "fcfYield", False), ("Earnings yield %", "earningsYield", False),
+               ("Yrs of net income", "priceToNi", True), ("Price/NCAV", "priceToNcav", True),
+               ("Dividend yield %", "dividendYield", False)]
+        for label, key, _ in VAL:
+            for t in chosen:
+                val = vprof[t].get(key)
+                if "yield" in label.lower() and val is not None:
+                    val = round(val * 100, 1)
+                sub.loc[t, label] = round(val, 2) if isinstance(val, (int, float)) else None
+
+        quality_cols = metric_set
+        val_cols = [(lbl, lb) for (lbl, _k, lb) in VAL]
+        show_cols = ["Company", "Score"] + [m for m, _ in quality_cols] + [m for m, _ in val_cols]
+        table = sub[show_cols].copy()
+
+        def _style(df):
+            sty = df.style.format(precision=1, na_rep="–")
+            for col, lower_better in [("Score", False)] + quality_cols + val_cols:
+                if col not in df.columns:
+                    continue
+                vals = pd.to_numeric(df[col], errors="coerce")
+                if vals.notna().sum() < 2:
+                    continue
+                sty = sty.background_gradient(
+                    cmap="RdYlGn_r" if lower_better else "RdYlGn", subset=[col], axis=0)
+                best = vals.idxmin() if lower_better else vals.idxmax()
+                sty = sty.set_properties(subset=pd.IndexSlice[[best], [col]],
+                                         **{"font-weight": "700", "border": "2px solid #1a7f37"})
+            return sty
+        st.dataframe(_style(table), use_container_width=True)
+        if is_fin:
+            st.caption("ROIC and EBIT-based leverage are omitted for financials — "
+                       "they aren't meaningful on a bank/insurer balance sheet.")
+
+        # normalized radar (quality metrics; skip lower-is-better leverage)
+        radar_metrics = [m for m, lb in quality_cols if not lb]
+        fig = go.Figure()
+        for t in chosen:
+            r = []
+            for m in radar_metrics:
+                col = pd.to_numeric(sub[m], errors="coerce")
+                lo, hi = col.min(), col.max()
+                x = pd.to_numeric(pd.Series([sub.loc[t, m]]), errors="coerce").iloc[0]
+                r.append(0.0 if pd.isna(x) or hi == lo else (x - lo) / (hi - lo) * 100)
+            fig.add_trace(go.Scatterpolar(r=r + r[:1], theta=radar_metrics + radar_metrics[:1],
+                                          fill="toself", name=t))
+        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100],
+                          showticklabels=False)), showlegend=True, height=440,
+                          margin=dict(l=40, r=40, t=20, b=20))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Radar is normalized per metric across only the selected companies "
+                   "(100 = best of this group, not an absolute score).")
+
+        st.markdown("#### What the price is telling you")
+        for t in chosen:
+            st.markdown(f"**{sub.loc[t, 'Company']}**")
+            cl = vprof[t].get("clues", [])
+            if cl:
+                for kind, txt in cl:
+                    st.markdown(f"{'🟢' if kind == 'good' else '🟠'} {txt}")
+            else:
+                st.caption("No standout value signals at the current price.")
+
+        st.download_button("Download as CSV", table.to_csv(),
+                           "jse_head_to_head.csv", "text/csv")
 
 
 def main():
