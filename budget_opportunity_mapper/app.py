@@ -1,7 +1,4 @@
-"""Budget Opportunity Mapper -- Streamlit dashboard.
-
-Run from inside the budget_opportunity_mapper/ folder:
-    streamlit run app.py
+"""Jamaica Budget Opportunity Mapper -- Streamlit dashboard.
 
 Web-first: pull official Jamaica budget PDFs (config/sources.json) on demand;
 PDF-fallback: upload your own budget PDF. All extracted figures go to a REVIEW
@@ -13,10 +10,8 @@ from __future__ import annotations
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
-
 import io
 import json
-import os
 from pathlib import Path
 
 import pandas as pd
@@ -31,33 +26,80 @@ from budget_mapper.reconciliation import reconcile, validate_all, is_healthy
 from budget_mapper import visuals
 
 st.set_page_config(page_title="Jamaica Budget Opportunity Mapper",
-                   page_icon="\U0001F1EF\U0001F1F2", layout="wide")
+                   page_icon="\U0001F1EF\U0001F1F2", layout="wide",
+                   initial_sidebar_state="expanded")
 
 HERE = Path(__file__).parent
 SOURCES_PATH = HERE / "config" / "sources.json"
 SME_THRESHOLD = 15_000_000  # JMD '000 (illustrative SME ceiling)
 
+# ----------------------------- theme / CSS ----------------------------
+st.markdown(
+    """
+    <style>
+      .stApp { background: radial-gradient(1200px 600px at 20% -10%, #16331F 0%, #0E1B14 55%, #0A140E 100%); }
+      #MainMenu, footer {visibility: hidden;}
+      .block-container {padding-top: 1.2rem; max-width: 1300px;}
+      .hero {
+        border-radius: 18px; padding: 26px 30px; margin-bottom: 14px;
+        background: linear-gradient(110deg, rgba(27,122,67,0.35), rgba(244,196,48,0.10));
+        border: 1px solid rgba(244,196,48,0.30);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      }
+      .hero h1 {font-size: 2.0rem; margin: 0; color: #FFFFFF; letter-spacing: -0.5px;}
+      .hero p {margin: 6px 0 0; color: #BFE3CB; font-size: 0.98rem;}
+      .pill {display:inline-block; padding:3px 12px; border-radius:999px;
+        font-size:0.74rem; font-weight:600; letter-spacing:.4px; margin-right:8px;}
+      .pill-green {background:rgba(61,187,107,0.18); color:#7BE3A0; border:1px solid rgba(61,187,107,0.4);}
+      .pill-gold {background:rgba(244,196,48,0.16); color:#F4C430; border:1px solid rgba(244,196,48,0.4);}
+      div[data-testid="stMetric"] {
+        background: linear-gradient(160deg, rgba(19,36,26,0.95), rgba(14,27,20,0.95));
+        border: 1px solid rgba(255,255,255,0.07); border-radius: 14px;
+        padding: 16px 18px; box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+      }
+      div[data-testid="stMetric"]:hover {border-color: rgba(244,196,48,0.45);}
+      div[data-testid="stMetricLabel"] p {color:#9DB3A4 !important; font-size:0.80rem;
+        text-transform:uppercase; letter-spacing:.5px;}
+      div[data-testid="stMetricValue"] {color:#FFFFFF !important; font-weight:700;}
+      .status-banner {border-radius:14px; padding:14px 20px; margin:6px 0 4px;
+        font-weight:600; font-size:1.05rem;}
+      .status-ok {background:rgba(61,187,107,0.14); color:#7BE3A0; border:1px solid rgba(61,187,107,0.45);}
+      .status-bad {background:rgba(231,76,60,0.14); color:#FF9B8E; border:1px solid rgba(231,76,60,0.45);}
+      .stTabs [data-baseweb="tab-list"] {gap: 6px;}
+      .stTabs [data-baseweb="tab"] {background:rgba(255,255,255,0.04); border-radius:10px 10px 0 0;
+        padding:8px 16px; color:#BFE3CB;}
+      .stTabs [aria-selected="true"] {background:rgba(27,122,67,0.35); color:#FFFFFF;}
+      section[data-testid="stSidebar"] {background:#0B1610; border-right:1px solid rgba(255,255,255,0.06);}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ----------------------------- state ---------------------------------
+# ----------------------------- state ----------------------------------
 @st.cache_resource
 def _seed_ledger() -> Ledger:
     return build_ledger()
 
 
 if "ledger" not in st.session_state:
-    # deep copy so edits in session don't mutate the cached seed
     st.session_state.ledger = Ledger.model_validate(_seed_ledger().model_dump())
 
 ledger: Ledger = st.session_state.ledger
 
 
+@st.cache_data
 def load_sources() -> list[dict]:
     if SOURCES_PATH.exists():
-        return json.loads(SOURCES_PATH.read_text()).get("sources", [])
+        return json.loads(SOURCES_PATH.read_text(encoding="utf-8"))
     return []
 
 
-# ----------------------------- helpers --------------------------------
+def money_total(led: Ledger, access_path: AccessPath) -> float:
+    return sum(n.amount for n in led.nodes
+               if n.node_type not in (NodeType.ROOT, NodeType.PARENT, NodeType.CROSS_CUT)
+               and n.access_path == access_path)
+
+
 def ledger_to_df(led: Ledger, include_cross_cut: bool = True) -> pd.DataFrame:
     rows = []
     for n in led.nodes:
@@ -77,76 +119,94 @@ def ledger_to_df(led: Ledger, include_cross_cut: bool = True) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def money_total(led: Ledger, **filters) -> float:
-    total = 0.0
-    for n in led.nodes:
-        if n.node_type in (NodeType.ROOT, NodeType.PARENT, NodeType.CROSS_CUT):
-            continue  # only leaves count, never cross-cut, never parents
-        ok = all(getattr(n, k) == v for k, v in filters.items())
-        if ok:
-            total += n.amount
-    return total
-
-
-def to_excel_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
+def to_excel_bytes(frames: dict) -> bytes:
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
-        for name, df in frames.items():
-            df.to_excel(xl, sheet_name=name[:31], index=False)
+    try:
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
+            for name, frame in frames.items():
+                frame.to_excel(xl, sheet_name=name[:31], index=False)
+    except Exception:
+        with pd.ExcelWriter(buf) as xl:
+            for name, frame in frames.items():
+                frame.to_excel(xl, sheet_name=name[:31], index=False)
     return buf.getvalue()
 
 
-# ----------------------------- sidebar --------------------------------
-st.sidebar.title("Budget Opportunity Mapper")
-st.sidebar.caption("Jamaica Government \u00b7 web-first, PDF-fallback")
+def fmt(v) -> str:
+    return f"J$ {v/1_000_000:,.1f}B" if v else "J$ 0"
 
-mode = st.sidebar.radio("Ingestion mode", ["Web-first (official PDFs)",
-                                           "Upload PDF (fallback)"])
+# ----------------------------- sidebar --------------------------------
+st.sidebar.markdown("### \U0001F1EF\U0001F1F2 Budget Opportunity Mapper")
+st.sidebar.caption("Jamaica Government \u00b7 web-first, PDF-fallback")
+st.sidebar.divider()
+
+mode = st.sidebar.radio("Ingestion mode",
+                        ["Web-first (official PDFs)", "Upload PDF (fallback)"])
 parent_options = [n.node_id for n in ledger.nodes
                   if n.node_type in (NodeType.ROOT, NodeType.PARENT)]
 
 if mode.startswith("Web"):
     st.sidebar.subheader("Official sources")
     for s in load_sources():
-        with st.sidebar.expander(s["title"]):
+        with st.sidebar.expander(s.get("title", "source")):
             st.write(s.get("description", ""))
-            st.write(s["url"])
+            if s.get("url"):
+                st.write(s["url"])
             if s.get("is_pdf"):
                 tgt = st.selectbox("Attach extracted lines under",
-                                   parent_options, key="p_" + s["id"])
-                if st.button("Fetch & extract", key="f_" + s["id"]):
+                                   parent_options, key="p_" + str(s.get("id", "")))
+                if st.button("Fetch & queue", key="f_" + str(s.get("id", ""))):
                     try:
-                        items = ingest_web_pdf(ledger, s["url"], s["title"], tgt,
-                                               max_pages=s.get("max_pages"))
-                        st.success(f"Extracted {len(items)} lines to review queue")
-                    except Exception as e:
-                        st.error(f"Fetch failed: {e}")
+                        items = ingest_web_pdf(ledger, s["url"], s.get("title") or s["url"], tgt)
+                        st.success(f"Queued {len(items)} extracted line(s) for review.")
+                    except Exception as exc:
+                        st.error(f"Fetch failed: {exc}")
 else:
-    up = st.sidebar.file_uploader("Upload budget PDF", type=["pdf"])
+    st.sidebar.subheader("Upload a budget PDF")
+    up = st.sidebar.file_uploader("PDF file", type=["pdf"])
     tgt = st.sidebar.selectbox("Attach under", parent_options)
-    if up and st.sidebar.button("Extract uploaded PDF"):
-        items = ingest_uploaded_pdf(ledger, up.read(), up.name, tgt)
-        st.sidebar.success(f"Extracted {len(items)} lines to review queue")
+    if up is not None and st.sidebar.button("Extract & queue"):
+        try:
+            items = ingest_uploaded_pdf(ledger, up.read(), up.name, tgt)
+            st.sidebar.success(f"Queued {len(items)} line(s) for review.")
+        except Exception as exc:
+            st.sidebar.error(f"Extraction failed: {exc}")
 
+st.sidebar.divider()
+st.sidebar.metric("Pending review items", len(ledger.review_queue))
+st.sidebar.caption("Extracted figures never overwrite verified values automatically.")
 
-# ----------------------------- header KPIs ----------------------------
-st.title("Jamaica Budget \u2192 Opportunity Map")
+# ----------------------------- header ---------------------------------
+root = next((n for n in ledger.nodes if n.node_type == NodeType.ROOT), None)
+central = next((n for n in ledger.nodes
+                if "central" in (n.node_id or "").lower()
+                and n.node_type == NodeType.PARENT), None)
+pb = next((n for n in ledger.nodes
+           if "public" in (n.node_id or "").lower()
+           and n.node_type == NodeType.PARENT), None)
 
-root = ledger.root()
-central = ledger.by_id("central")
-pb = ledger.by_id("pb_capex")
+st.markdown(
+    """
+    <div class="hero">
+      <span class="pill pill-green">WEB-FIRST</span>
+      <span class="pill pill-gold">RECONCILED LEDGER</span>
+      <h1>Jamaica Budget &rarr; Opportunity Map</h1>
+      <p>Every dollar mapped to a single reconciled tree &mdash; no double counting &mdash;
+         showing where contractors, suppliers, consultants, SMEs and citizens access value.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-contractor_mkt = money_total(ledger, access_path=AccessPath.PROCUREMENT_CONTRACTOR)
-supplier_mkt = money_total(ledger, access_path=AccessPath.PROCUREMENT_SUPPLIER)
-consultant_mkt = money_total(ledger, access_path=AccessPath.PROCUREMENT_CONSULTANT)
-welfare_mkt = money_total(ledger, access_path=AccessPath.CITIZEN_WELFARE)
-pb_mkt = money_total(ledger, access_path=AccessPath.PUBLIC_BODY_INVESTMENT)
+# ----------------------------- KPI markets ----------------------------
+contractor_mkt = money_total(ledger, AccessPath.PROCUREMENT_CONTRACTOR)
+supplier_mkt = money_total(ledger, AccessPath.PROCUREMENT_SUPPLIER)
+consultant_mkt = money_total(ledger, AccessPath.PROCUREMENT_CONSULTANT)
+welfare_mkt = money_total(ledger, AccessPath.CITIZEN_WELFARE)
+pb_mkt = money_total(ledger, AccessPath.PUBLIC_BODY_INVESTMENT)
 sme_mkt = sum(n.amount for n in ledger.nodes
               if n.node_type not in (NodeType.ROOT, NodeType.PARENT, NodeType.CROSS_CUT)
               and is_sme_accessible(n, SME_THRESHOLD))
-
-def fmt(v):
-    return f"J$ {v/1_000_000:,.1f}B" if v else "J$ 0"
 
 c = st.columns(4)
 c[0].metric("Master Opportunity Total", fmt(root.amount if root else 0))
@@ -157,28 +217,32 @@ c2 = st.columns(4)
 c2[0].metric("Supplier market", fmt(supplier_mkt))
 c2[1].metric("Consultant market", fmt(consultant_mkt))
 c2[2].metric("SME-accessible", fmt(sme_mkt))
-c2[3].metric("Citizen/Welfare", fmt(welfare_mkt))
+c2[3].metric("Citizen / Welfare", fmt(welfare_mkt))
 
 issues = validate_all(ledger)
 healthy = is_healthy(ledger)
-st.markdown(
-    f"### Reconciliation status: "
-    + ("\u2705 HEALTHY" if healthy else "\u26A0\uFE0F ISSUES FOUND"))
-if not healthy:
+if healthy:
+    st.markdown('<div class="status-banner status-ok">\u2705 Reconciliation status: HEALTHY \u2014 all parents reconcile to children, single root, no double counting.</div>', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="status-banner status-bad">\u26A0\uFE0F Reconciliation status: ISSUES FOUND</div>', unsafe_allow_html=True)
     for k, v in issues.items():
         for msg in v:
             st.warning(f"[{k}] {msg}")
 
-st.divider()
+st.write("")
 
 # ----------------------------- charts ---------------------------------
-df_all = ledger_to_df(ledger, include_cross_cut=False)  # money tree only
-df_with_xc = ledger_to_df(ledger, include_cross_cut=True)
+df_all = ledger_to_df(ledger, include_cross_cut=False)
+recon = reconcile(ledger)
+recon_df = pd.DataFrame([r.model_dump() for r in recon]) if recon else pd.DataFrame()
 
 tab1, tab2, tab3, tab4 = st.tabs(
-    ["Budget Tree", "Bridge & Reconciliation", "Opportunities", "Tables & Review"])
+    ["\U0001F333 Budget Tree", "\U0001F501 Bridge & Reconciliation",
+     "\U0001F4BC Opportunities", "\U0001F4CB Tables & Review"])
 
 with tab1:
+    st.caption("The full reconciled money tree. Sunburst shows share of the master "
+               "total; treemap shows relative weight by parent.")
     a, b = st.columns(2)
     a.subheader("Sunburst")
     a.plotly_chart(visuals.sunburst_tree(df_all), use_container_width=True)
@@ -186,15 +250,12 @@ with tab1:
     b.plotly_chart(visuals.treemap_tree(df_all), use_container_width=True)
 
 with tab2:
-    st.subheader("Waterfall: Central + Public Bodies \u2192 Master Total")
     st.plotly_chart(visuals.waterfall_to_master(
         central.amount if central else 0, pb.amount if pb else 0,
         root.amount if root else 0), use_container_width=True)
-    st.subheader("Reconciliation: parent vs children")
-    recon = reconcile(ledger)
-    recon_df = pd.DataFrame([r.model_dump() for r in recon])
     st.plotly_chart(visuals.reconciliation_chart(recon_df), use_container_width=True)
-    st.dataframe(recon_df, use_container_width=True)
+    if not recon_df.empty:
+        st.dataframe(recon_df, use_container_width=True, hide_index=True)
 
 with tab3:
     leaves = df_all[~df_all["node_type"].isin(["ROOT", "PARENT"])]
@@ -202,68 +263,54 @@ with tab3:
     a.plotly_chart(visuals.opportunity_by_dimension(
         leaves, "access_path", "Opportunity by access path"), use_container_width=True)
     b.plotly_chart(visuals.opportunity_by_dimension(
-        leaves.assign(ministry=leaves["ministry"].fillna("(unassigned)")),
-        "ministry", "Opportunity by ministry/agency"), use_container_width=True)
+        leaves, "ministry", "Opportunity by ministry"), use_container_width=True)
     st.plotly_chart(visuals.opportunity_by_dimension(
-        leaves, "funding_stream", "Opportunity by funding stream"),
-        use_container_width=True)
+        leaves, "funding_stream", "Opportunity by funding stream"), use_container_width=True)
 
 with tab4:
-    st.subheader("Search & drilldown")
-    fc = st.columns(4)
-    f_min = fc[0].text_input("Ministry contains")
-    f_path = fc[1].selectbox("Access path", ["(all)"] + sorted(df_all["access_path"].unique()))
-    f_src = fc[2].text_input("Source contains")
-    f_text = fc[3].text_input("Name contains")
-    view = df_all.copy()
-    if f_min:
-        view = view[view["ministry"].fillna("").str.contains(f_min, case=False)]
-    if f_path != "(all)":
-        view = view[view["access_path"] == f_path]
-    if f_src:
-        view = view[view["source_title"].fillna("").str.contains(f_src, case=False)]
-    if f_text:
-        view = view[view["name"].str.contains(f_text, case=False)]
+    st.subheader("Full ledger")
+    q = st.text_input("Search (name / ministry / project / source)", "")
+    view = df_all
+    if q:
+        mask = df_all.apply(lambda r: q.lower() in " ".join(
+            str(x).lower() for x in r.values), axis=1)
+        view = df_all[mask]
+    st.dataframe(view, use_container_width=True, hide_index=True)
 
-    st.markdown("**Full ledger**")
-    st.dataframe(view, use_container_width=True)
-
-    st.markdown("**Source table**")
-    st.dataframe(df_with_xc[["name", "source_title", "source_url", "source_page",
-                             "method", "confidence", "quote"]],
-                 use_container_width=True)
-
-    st.markdown("**Reconciliation issues**")
-    issue_rows = [{"check": k, "message": m} for k, v in issues.items() for m in v]
-    st.dataframe(pd.DataFrame(issue_rows) if issue_rows
-                 else pd.DataFrame([{"check": "all", "message": "No issues"}]),
-                 use_container_width=True)
-
-    st.markdown("**Extracted-but-unverified (review queue)**")
-    pending = [r for r in ledger.review_queue if r.status == "pending"]
-    if not pending:
-        st.info("Review queue empty.")
-    for r in pending:
-        n = r.proposed_node
-        cols = st.columns([4, 2, 2, 1, 1])
-        cols[0].write(f"**{n.name}** \u2014 {n.amount:,.0f} (p.{n.source.page})")
-        cols[1].write(r.reason)
-        cols[2].write(n.source.title)
-        if cols[3].button("Accept", key="acc_" + r.review_id):
-            accept_review_item(ledger, r.review_id)
-            st.rerun()
-        if cols[4].button("Reject", key="rej_" + r.review_id):
-            reject_review_item(ledger, r.review_id)
-            st.rerun()
+    cda, cdb = st.columns(2)
+    cda.download_button("Download ledger (CSV)", view.to_csv(index=False).encode("utf-8"),
+                        "ledger.csv", "text/csv", use_container_width=True)
+    frames = {"ledger": df_all, "reconciliation": recon_df}
+    cdb.download_button("Download workbook (Excel)", to_excel_bytes(frames),
+                        "budget_opportunity_mapper.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True)
 
     st.divider()
-    st.subheader("Export")
-    frames = {"ledger": df_with_xc,
-              "reconciliation": pd.DataFrame([x.model_dump() for x in reconcile(ledger)]),
-              "issues": pd.DataFrame(issue_rows)}
-    e1, e2 = st.columns(2)
-    e1.download_button("Download Excel", to_excel_bytes(frames),
-                       "budget_opportunity_map.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    e2.download_button("Download CSV (ledger)", df_with_xc.to_csv(index=False),
-                       "ledger.csv", "text/csv")
+    st.subheader(f"Review queue ({len(ledger.review_queue)} pending)")
+    if not ledger.review_queue:
+        st.info("No extracted figures awaiting review. Use the sidebar to fetch or upload a PDF.")
+    for item in list(ledger.review_queue):
+        if getattr(item, "status", "pending") != "pending":
+            continue
+        pn = item.proposed_node
+        with st.expander(f"{pn.name} \u2014 {fmt(pn.amount)} ({item.reason})"):
+            st.write(f"Source: {pn.source.title}")
+            if pn.source.url:
+                st.write(pn.source.url)
+            if pn.source.page is not None:
+                st.write(f"Page {pn.source.page}")
+            if pn.source.quote:
+                st.caption(pn.source.quote)
+            ca, cb = st.columns(2)
+            if ca.button("Accept", key="acc_" + item.review_id):
+                accept_review_item(ledger, item.review_id)
+                st.rerun()
+            if cb.button("Reject", key="rej_" + item.review_id):
+                reject_review_item(ledger, item.review_id)
+                st.rerun()
+
+st.divider()
+st.caption("Seed figures are clearly-labelled ILLUSTRATIVE placeholders. Replace them "
+           "with verified figures via the review queue. Amounts are JMD \u2019000 "
+           "unless shown as J$B.")
