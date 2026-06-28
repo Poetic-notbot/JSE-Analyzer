@@ -23,8 +23,8 @@ Why this version exists
 The original (2025) version scraped HTML tables from stockanalysis.com. The site
 has since been rebuilt and the data now lives in a JSON payload behind each page
 (`__data.json`), so the old HTML scraper no longer works. This version reads
-that JSON feed instead, which is far more reliable. Everything else â the idea,
-the drill-down, the narrative, the valuation â is preserved.
+that JSON feed instead, which is far more reliable. Everything else \u2014 the idea,
+the drill-down, the narrative, the valuation \u2014 is preserved.
 
 Run it locally with:
     pip install -r requirements.txt
@@ -41,7 +41,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# 1. DATA LAYER  â read financial statements from stockanalysis.com's JSON feed
+# 1. DATA LAYER  \u2014 read financial statements from stockanalysis.com's JSON feed
 # ---------------------------------------------------------------------------
 # The site is built with SvelteKit. Every financials page has a sibling URL
 # ending in "/__data.json" that returns the same numbers as structured data.
@@ -301,7 +301,7 @@ FALLBACK_TICKERS = [
 
 
 # ---------------------------------------------------------------------------
-# 2. ANALYSIS HELPERS  â components, drivers, growth, narrative, ratios
+# 2. ANALYSIS HELPERS  \u2014 components, drivers, growth, narrative, ratios
 # ---------------------------------------------------------------------------
 
 def clean_series(df, item):
@@ -732,9 +732,9 @@ def decomposition_children(df, parent, aggregates, cascade=False):
 def decomposable_parents(df, aggregates, statement):
     """
     Parent metrics offered for decomposition, sourced ONLY from THIS statement's
-    own dataframe. A row qualifies if it is a subtotal â either flagged by the
+    own dataframe. A row qualifies if it is a subtotal \u2014 either flagged by the
     feed (`aggregates`) or a well-known additive subtotal name for `statement`
-    that the ticker actually reports â and it has >=2 decomposable components.
+    that the ticker actually reports \u2014 and it has >=2 decomposable components.
 
     Returns (parents_in_statement_order, effective_aggregates). The effective
     aggregates (feed flags unioned with recognised subtotal names present in the
@@ -1002,7 +1002,7 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12, cascade=False)
     mix_shift_leader = ({"name": leader["name"], "from_pct": leader["from_pct"],
                          "to_pct": leader["to_pct"]} if leader else None)
 
-    return {"parent": parent, "year0": y0, "yearN": yN, "span": f"{y0}â{yN}",
+    return {"parent": parent, "year0": y0, "yearN": yN, "span": f"{y0}\u2013{yN}",
             "p0": p0, "pN": pN, "parent_delta": parent_delta,
             "parent_cagr": cagr(p), "parent_pct": pct_change_total(p),
             "components": components, "significant": significant,
@@ -1154,7 +1154,7 @@ def decomposition_narrative(d, currency, income=None, balance=None):
                 if d["parent_cagr"] is not None else "")
     lines = [
         f"**{p}** {direction} by {fmt_money(abs(pd_delta), currency)}{pct_txt} over "
-        f"{d['span']} ({fmt_money(d['p0'], currency)} â {fmt_money(d['pN'], currency)}){cagr_txt}."
+        f"{d['span']} ({fmt_money(d['p0'], currency)} \u2192 {fmt_money(d['pN'], currency)}){cagr_txt}."
     ]
     drv = d["driver"]
     if drv and drv["delta"] is not None:
@@ -1187,7 +1187,7 @@ def decomposition_narrative(d, currency, income=None, balance=None):
         if abs(d["unexplained"]) > 0.05 * abs(pd_delta):
             lines.append(f"Identified components account for {fmt_money(d['explained'], currency)} "
                          f"of the change ({exp_pct:.0f}%); {fmt_money(d['unexplained'], currency)} is "
-                         f"unexplained â the rest sits in rows the feed groups differently.")
+                         f"unexplained \u2014 the rest sits in rows the feed groups differently.")
         else:
             lines.append("Identified components reconcile closely to the total change, so the "
                          "breakdown captures essentially all of the movement.")
@@ -1371,7 +1371,7 @@ def mix_shift_chart(df, parent, comp_names, title):
 
 
 # ---------------------------------------------------------------------------
-# 3.5  BUSINESS CLASSIFICATION ("Verdict")  â forensic, financials-driven
+# 3.5  BUSINESS CLASSIFICATION ("Verdict")  \u2014 forensic, financials-driven
 # ---------------------------------------------------------------------------
 # Every stamp and score below is derived strictly from reported figures.
 # Nothing here is opinion: each verdict cites the numbers that produced it.
@@ -2358,7 +2358,7 @@ def main():
 
     # ---- Overview ---------------------------------------------------------
     with tabs[0]:
-        st.subheader(f"{companies.get(ticker, ticker)} â overview")
+        st.subheader(f"{companies.get(ticker, ticker)} \u2014 overview")
         st.write(f"Reporting currency: **{currency}**")
         col1, col2 = st.columns(2)
 
@@ -2407,7 +2407,7 @@ def main():
             cols = st.columns(min(5, len(headline)))
             for i, r in enumerate(headline[:5]):
                 cols[i].metric(abbrev.get(r["name"], r["name"]), f"{r['value']:.1f}",
-                               help=f"{r['name']} â {r.get('desc', '')}")
+                               help=f"{r['name']} \u2014 {r.get('desc', '')}")
 
     # ---- Verdict ----------------------------------------------------------
     with tabs[1]:
@@ -2437,7 +2437,7 @@ def main():
             c1, c2 = st.columns(2)
             c1.plotly_chart(bar_chart(s, f"{item}", currency), use_container_width=True)
             if len(s) > 1:
-                c2.plotly_chart(growth_chart(s, f"{item} â yearly growth"),
+                c2.plotly_chart(growth_chart(s, f"{item} \u2014 yearly growth"),
                                 use_container_width=True)
 
             key, base_name = PRIMARY_TOTAL.get(sname, (None, None))
@@ -2458,7 +2458,7 @@ def main():
         st.subheader("Decomposition")
         st.caption(
             "For a composite metric, see how it changed over the available years "
-            "and which components drove it â using only this company's reported data."
+            "and which components drove it \u2014 using only this company's reported data."
         )
         decomp_sources = {
             "Income Statement": (income, inc_agg),
@@ -2494,7 +2494,7 @@ def main():
                               help="Parent change minus identified component changes")
                     if d["driver"] and d["driver"]["delta"] is not None:
                         drv = d["driver"]
-                        sign = "+" if drv["delta"] >= 0 else "â"
+                        sign = "+" if drv["delta"] >= 0 else "\u2212"
                         st.markdown(f"**Biggest driver:** {drv['name']} "
                                     f"({sign}{fmt_money_compact(abs(drv['delta']), currency)})")
 
@@ -2536,7 +2536,7 @@ def main():
             st.metric(r["name"], f"{r['value']:.2f}", help=r["desc"])
             info = series_by_name.get(r["name"])
             if info is not None and len(info["series"]) > 1:
-                ylab = "%" if info["unit"] == "%" else "Ratio (Ã)"
+                ylab = "%" if info["unit"] == "%" else "Ratio (\u00d7)"
                 st.plotly_chart(
                     line_chart(info["series"], f"{r['name']} over time", ylab),
                     use_container_width=True)
