@@ -23,8 +23,8 @@ Why this version exists
 The original (2025) version scraped HTML tables from stockanalysis.com. The site
 has since been rebuilt and the data now lives in a JSON payload behind each page
 (`__data.json`), so the old HTML scraper no longer works. This version reads
-that JSON feed instead, which is far more reliable. Everything else — the idea,
-the drill-down, the narrative, the valuation — is preserved.
+that JSON feed instead, which is far more reliable. Everything else â the idea,
+the drill-down, the narrative, the valuation â is preserved.
 
 Run it locally with:
     pip install -r requirements.txt
@@ -41,7 +41,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# 1. DATA LAYER  — read financial statements from stockanalysis.com's JSON feed
+# 1. DATA LAYER  â read financial statements from stockanalysis.com's JSON feed
 # ---------------------------------------------------------------------------
 # The site is built with SvelteKit. Every financials page has a sibling URL
 # ending in "/__data.json" that returns the same numbers as structured data.
@@ -82,6 +82,43 @@ USD_REPORTERS = {
     "MASSY", "SRFUSD", "SILUS", "PULS", "TJHUSD", "SELECTMD",
 }
 DEFAULT_USD_JMD = 158.0  # rough fallback rate; only used for USD reporters
+
+# Cache of FX context per ticker so the UI can show the conversion that was
+# applied. Keeps the get_statement return signature unchanged.
+_FX_CONTEXT = {}
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def get_usd_jmd_rate():
+    """Live USD->JMD rate (cached 6h), falling back to DEFAULT_USD_JMD."""
+    try:
+        raw = _fetch("https://open.er-api.com/v6/latest/USD")
+        rate = float(json.loads(raw)["rates"]["JMD"])
+        if 100 < rate < 250:          # sanity band for USD/JMD
+            return rate
+    except Exception:
+        pass
+    return DEFAULT_USD_JMD
+
+
+def _apply_fx(ticker, df, aggregates, currency):
+    """Convert a USD-reported statement into JMD so figures are comparable.
+    Per-share values are unaffected (numerator and denominator scale together);
+    absolute JMD figures become comparable across the exchange. Same 3-tuple
+    shape is returned, currency relabelled to JMD once converted."""
+    reported = currency
+    fx = 1.0
+    if currency == "USD":
+        fx = get_usd_jmd_rate()
+        if df is not None:
+            df = df * fx
+        if isinstance(aggregates, dict):
+            aggregates = {k: (v * fx if isinstance(v, (int, float)) else v)
+                          for k, v in aggregates.items()}
+        currency = "JMD"
+    _FX_CONTEXT[ticker] = {"reported": reported, "rate": fx}
+    return df, aggregates, currency
+
 
 
 def _fetch(url, retries=4, delay=1.4):
@@ -217,7 +254,7 @@ def get_statement(ticker, statement):
 
     df = pd.DataFrame(rows, index=year_labels).T      # rows=line items, cols=years
     df = df.apply(pd.to_numeric, errors="coerce")
-    return df, aggregates, currency
+    return _apply_fx(ticker, df, aggregates, currency)
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
@@ -264,7 +301,7 @@ FALLBACK_TICKERS = [
 
 
 # ---------------------------------------------------------------------------
-# 2. ANALYSIS HELPERS  — components, drivers, growth, narrative, ratios
+# 2. ANALYSIS HELPERS  â components, drivers, growth, narrative, ratios
 # ---------------------------------------------------------------------------
 
 def clean_series(df, item):
@@ -695,9 +732,9 @@ def decomposition_children(df, parent, aggregates, cascade=False):
 def decomposable_parents(df, aggregates, statement):
     """
     Parent metrics offered for decomposition, sourced ONLY from THIS statement's
-    own dataframe. A row qualifies if it is a subtotal — either flagged by the
+    own dataframe. A row qualifies if it is a subtotal â either flagged by the
     feed (`aggregates`) or a well-known additive subtotal name for `statement`
-    that the ticker actually reports — and it has >=2 decomposable components.
+    that the ticker actually reports â and it has >=2 decomposable components.
 
     Returns (parents_in_statement_order, effective_aggregates). The effective
     aggregates (feed flags unioned with recognised subtotal names present in the
@@ -965,7 +1002,7 @@ def decompose(df, parent, aggregates, sig_frac=0.05, max_bars=12, cascade=False)
     mix_shift_leader = ({"name": leader["name"], "from_pct": leader["from_pct"],
                          "to_pct": leader["to_pct"]} if leader else None)
 
-    return {"parent": parent, "year0": y0, "yearN": yN, "span": f"{y0}–{yN}",
+    return {"parent": parent, "year0": y0, "yearN": yN, "span": f"{y0}â{yN}",
             "p0": p0, "pN": pN, "parent_delta": parent_delta,
             "parent_cagr": cagr(p), "parent_pct": pct_change_total(p),
             "components": components, "significant": significant,
@@ -1117,7 +1154,7 @@ def decomposition_narrative(d, currency, income=None, balance=None):
                 if d["parent_cagr"] is not None else "")
     lines = [
         f"**{p}** {direction} by {fmt_money(abs(pd_delta), currency)}{pct_txt} over "
-        f"{d['span']} ({fmt_money(d['p0'], currency)} → {fmt_money(d['pN'], currency)}){cagr_txt}."
+        f"{d['span']} ({fmt_money(d['p0'], currency)} â {fmt_money(d['pN'], currency)}){cagr_txt}."
     ]
     drv = d["driver"]
     if drv and drv["delta"] is not None:
@@ -1150,7 +1187,7 @@ def decomposition_narrative(d, currency, income=None, balance=None):
         if abs(d["unexplained"]) > 0.05 * abs(pd_delta):
             lines.append(f"Identified components account for {fmt_money(d['explained'], currency)} "
                          f"of the change ({exp_pct:.0f}%); {fmt_money(d['unexplained'], currency)} is "
-                         f"unexplained — the rest sits in rows the feed groups differently.")
+                         f"unexplained â the rest sits in rows the feed groups differently.")
         else:
             lines.append("Identified components reconcile closely to the total change, so the "
                          "breakdown captures essentially all of the movement.")
@@ -1334,7 +1371,7 @@ def mix_shift_chart(df, parent, comp_names, title):
 
 
 # ---------------------------------------------------------------------------
-# 3.5  BUSINESS CLASSIFICATION ("Verdict")  — forensic, financials-driven
+# 3.5  BUSINESS CLASSIFICATION ("Verdict")  â forensic, financials-driven
 # ---------------------------------------------------------------------------
 # Every stamp and score below is derived strictly from reported figures.
 # Nothing here is opinion: each verdict cites the numbers that produced it.
@@ -2168,6 +2205,96 @@ def render_verdict(income, balance, cashflow, currency, company_name):
 # 4. USER INTERFACE
 # ---------------------------------------------------------------------------
 
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner="Scoring the JSE universe...")
+def build_universe():
+    """Score every JSE company once and return a tidy comparison table.
+    Reuses assess_business() so scores/stamps match the single-company view."""
+    rows = []
+    companies = get_companies()
+    for tkr, name in companies.items():
+        try:
+            income, _, _ = get_statement(tkr, "Income Statement")
+            balance, _, _ = get_statement(tkr, "Balance Sheet")
+            cash, _, _ = get_statement(tkr, "Cash Flow")
+            if income is None or balance is None:
+                continue
+            a = assess_business(income, balance, cash)
+            p = a["panel"]
+            fxc = _FX_CONTEXT.get(tkr, {})
+            def pct(x):
+                return round(x * 100, 1) if isinstance(x, (int, float)) else None
+            def num(x, nd=2):
+                return round(x, nd) if isinstance(x, (int, float)) else None
+            rows.append({
+                "Ticker": tkr,
+                "Company": name,
+                "Type": a["typeLabel"],
+                "Score": a["overall"],
+                "Band": a["band"],
+                "ROE %": pct(p.get("roe")),
+                "Op margin %": pct(p.get("opMargin")),
+                "Net margin %": pct(p.get("netMargin")),
+                "FCF margin %": pct(p.get("fcfMargin")),
+                "Rev CAGR %": pct(p.get("revCagr")),
+                "Net debt/EBITDA": num(p.get("netDebtToEbitda")),
+                "Interest cover": num(p.get("intCover")),
+                "Reported ccy": fxc.get("reported", "JMD"),
+                "Stamps": ", ".join(s.get("name", "") for s in a.get("stamps", [])),
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+def render_compare():
+    """Compare/screen the whole exchange: by industry, quality (investible
+    universe), various metrics, and arbitrary head-to-head."""
+    st.title("Compare companies")
+    st.caption("Every score reuses the same disciplined, financials-only engine "
+               "as the single-company view. Not investment advice.")
+    uni = build_universe()
+    if uni.empty:
+        st.warning("Could not score any companies right now. Try again shortly.")
+        return
+
+    tab_screen, tab_h2h = st.tabs(["Screen the universe", "Head-to-head"])
+
+    with tab_screen:
+        c1, c2, c3 = st.columns(3)
+        investible = c1.checkbox("Investible universe only (score > 70)", value=True)
+        types = c2.multiselect("Industry / type", sorted(uni["Type"].unique()))
+        sort_by = c3.selectbox("Rank by", [
+            "Score", "ROE %", "Op margin %", "Net margin %", "FCF margin %",
+            "Rev CAGR %", "Interest cover", "Net debt/EBITDA (low to high)",
+        ])
+
+        view = uni.copy()
+        if investible:
+            view = view[view["Score"] > 70]
+        if types:
+            view = view[view["Type"].isin(types)]
+
+        ascending = "low to high" in sort_by
+        key = sort_by.split(" (")[0].strip()
+        view = view.sort_values(key, ascending=ascending, na_position="last")
+
+        st.caption(f"{len(view)} companies match.")
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.download_button("Download as CSV", view.to_csv(index=False),
+                           "jse_screen.csv", "text/csv")
+
+    with tab_h2h:
+        options = [f"{r.Ticker} \u2014 {r.Company}" for r in uni.itertuples()]
+        picks = st.multiselect("Pick any 2 or more companies to compare", options)
+        if len(picks) >= 2:
+            chosen = [p.split(" \u2014 ")[0] for p in picks]
+            sub = uni[uni["Ticker"].isin(chosen)]
+            st.dataframe(sub.set_index("Ticker").T, use_container_width=True)
+            st.bar_chart(sub.set_index("Company")["Score"])
+        else:
+            st.info("Choose at least two companies to see them side by side.")
+
+
 def main():
     st.set_page_config(page_title="JSE Financial Analyzer", layout="wide")
     # Keep metric values (e.g. "JMD 523.7M") from being clipped in the narrow
@@ -2195,6 +2322,10 @@ def main():
     )
 
     companies = get_companies()
+    mode = st.sidebar.radio("Mode", ["Analyze one company", "Compare companies"])
+    if mode == "Compare companies":
+        render_compare()
+        return
     labels = [f"{t} \u2014 {n}" for t, n in companies.items()]
     sym_by_label = {f"{t} \u2014 {n}": t for t, n in companies.items()}
 
@@ -2227,7 +2358,7 @@ def main():
 
     # ---- Overview ---------------------------------------------------------
     with tabs[0]:
-        st.subheader(f"{companies.get(ticker, ticker)} — overview")
+        st.subheader(f"{companies.get(ticker, ticker)} â overview")
         st.write(f"Reporting currency: **{currency}**")
         col1, col2 = st.columns(2)
 
@@ -2276,7 +2407,7 @@ def main():
             cols = st.columns(min(5, len(headline)))
             for i, r in enumerate(headline[:5]):
                 cols[i].metric(abbrev.get(r["name"], r["name"]), f"{r['value']:.1f}",
-                               help=f"{r['name']} — {r.get('desc', '')}")
+                               help=f"{r['name']} â {r.get('desc', '')}")
 
     # ---- Verdict ----------------------------------------------------------
     with tabs[1]:
@@ -2306,7 +2437,7 @@ def main():
             c1, c2 = st.columns(2)
             c1.plotly_chart(bar_chart(s, f"{item}", currency), use_container_width=True)
             if len(s) > 1:
-                c2.plotly_chart(growth_chart(s, f"{item} — yearly growth"),
+                c2.plotly_chart(growth_chart(s, f"{item} â yearly growth"),
                                 use_container_width=True)
 
             key, base_name = PRIMARY_TOTAL.get(sname, (None, None))
@@ -2327,7 +2458,7 @@ def main():
         st.subheader("Decomposition")
         st.caption(
             "For a composite metric, see how it changed over the available years "
-            "and which components drove it — using only this company's reported data."
+            "and which components drove it â using only this company's reported data."
         )
         decomp_sources = {
             "Income Statement": (income, inc_agg),
@@ -2363,7 +2494,7 @@ def main():
                               help="Parent change minus identified component changes")
                     if d["driver"] and d["driver"]["delta"] is not None:
                         drv = d["driver"]
-                        sign = "+" if drv["delta"] >= 0 else "−"
+                        sign = "+" if drv["delta"] >= 0 else "â"
                         st.markdown(f"**Biggest driver:** {drv['name']} "
                                     f"({sign}{fmt_money_compact(abs(drv['delta']), currency)})")
 
@@ -2405,7 +2536,7 @@ def main():
             st.metric(r["name"], f"{r['value']:.2f}", help=r["desc"])
             info = series_by_name.get(r["name"])
             if info is not None and len(info["series"]) > 1:
-                ylab = "%" if info["unit"] == "%" else "Ratio (×)"
+                ylab = "%" if info["unit"] == "%" else "Ratio (Ã)"
                 st.plotly_chart(
                     line_chart(info["series"], f"{r['name']} over time", ylab),
                     use_container_width=True)
@@ -2450,6 +2581,24 @@ def main():
             st.metric("Value at 12x earnings",
                       f"{currency} {val['pe_value_12x']:,.2f}",
                       help=f"Latest EPS: {currency} {val.get('eps', 0):,.2f}")
+        _fxc = _FX_CONTEXT.get(ticker, {})
+        if _fxc.get("reported") == "USD":
+            st.caption(
+                f"Reported in USD; converted to JMD at {_fxc.get('rate', 0):,.2f} "
+                "(live rate, 6-hour cache)."
+            )
+        _dcf = val.get("dcf_per_share")
+        _mult = val.get("pe_value_12x")
+        if isinstance(_dcf, (int, float)) and isinstance(_mult, (int, float)) and _mult:
+            if _dcf < 0.6 * _mult:
+                st.info(
+                    "The DCF sits well below the earnings multiple. That is usually "
+                    "real, not an error: this business turns relatively little profit "
+                    "into free cash flow and/or carries net debt, both of which the "
+                    "DCF captures but a simple earnings multiple does not."
+                )
+            else:
+                st.caption("DCF and the earnings multiple broadly agree.")
         st.caption("Adjust the discount rate and long-term growth in the sidebar "
                    "to test how sensitive the estimate is.")
 
