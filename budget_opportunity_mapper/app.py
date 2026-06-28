@@ -178,12 +178,15 @@ st.sidebar.caption("Extracted figures never overwrite verified values automatica
 
 # ----------------------------- header ---------------------------------
 root = next((n for n in ledger.nodes if n.node_type == NodeType.ROOT), None)
-central = next((n for n in ledger.nodes
-                if "central" in (n.node_id or "").lower()
-                and n.node_type == NodeType.PARENT), None)
-pb = next((n for n in ledger.nodes
-           if "public" in (n.node_id or "").lower()
-           and n.node_type == NodeType.PARENT), None)
+def _find(*ids):
+    for nid in ids:
+        for n in ledger.nodes:
+            if n.node_id == nid:
+                return n
+    return None
+
+central = _find("central")
+pb = _find("pb_capex", "public_bodies", "pb")
 
 st.markdown(
     """
