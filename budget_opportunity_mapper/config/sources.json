@@ -1,0 +1,62 @@
+{
+  "_comment": "Official Jamaica government budget sources. URLs verified live on mof.gov.jm. Hub pages link to the actual PDFs (Estimates, Fiscal Policy Paper, Public Bodies). Set 'is_pdf': true and a direct .pdf 'url' once you copy the specific document link from the hub page, then the app can fetch & extract it on demand.",
+  "currency_unit": "JMD '000",
+  "sources": [
+    {
+      "id": "budget_presentation",
+      "title": "Budget Presentation / Speech",
+      "url": "https://www.mof.gov.jm/budget",
+      "description": "Annual budget presentation hub (Ministry of Finance & the Public Service).",
+      "is_pdf": false
+    },
+    {
+      "id": "estimates_expenditure",
+      "title": "Estimates of Expenditure (Annual & Supplementary)",
+      "url": "https://www.mof.gov.jm/resources-annual-and-supplementary-estimates/",
+      "description": "Estimates of Expenditure by ministry, programme and object. Primary source for central-government recurrent and capital lines.",
+      "is_pdf": false
+    },
+    {
+      "id": "revenue_estimates",
+      "title": "Revenue Estimates",
+      "url": "https://www.mof.gov.jm/budget/revenue-estimates",
+      "description": "Estimates of Revenue.",
+      "is_pdf": false
+    },
+    {
+      "id": "public_bodies_budget",
+      "title": "Public Bodies Estimates",
+      "url": "https://www.mof.gov.jm/budget/public-bodies-budget",
+      "description": "Public Bodies' capital and operating estimates. Keep public-body capex SEPARATE from central government unless explicitly consolidated.",
+      "is_pdf": false
+    },
+    {
+      "id": "fiscal_policy_paper",
+      "title": "Fiscal Policy Paper",
+      "url": "https://www.mof.gov.jm/fiscal-operations",
+      "description": "Fiscal Policy Papers (macro-fiscal framework, fiscal targets).",
+      "is_pdf": false
+    },
+    {
+      "id": "citizens_guide",
+      "title": "Citizens' Guide to the Budget",
+      "url": "https://www.mof.gov.jm/resources-citizens-guide-to-the-budget",
+      "description": "Plain-language summary of the budget for the public.",
+      "is_pdf": false
+    },
+    {
+      "id": "all_documents",
+      "title": "MOFPS Documents Library",
+      "url": "https://www.mof.gov.jm/documents",
+      "description": "Full document library; locate specific year PDFs here.",
+      "is_pdf": false
+    },
+    {
+      "id": "gojep",
+      "title": "GOJEP - Government of Jamaica Electronic Procurement",
+      "url": "https://www.gojep.gov.jm",
+      "description": "Tender notices and contract awards. Use for tender/opportunity drilldown.",
+      "is_pdf": false
+    }
+  ]
+}
