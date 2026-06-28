@@ -1,3 +1,16 @@
+# Loosened pins so Streamlit Cloud installs prebuilt wheels (no source builds).
+# Pair this with .python-version (3.12) at the repo root for stable wheels.
+streamlit>=1.39
+pandas>=2.2
+plotly>=5.24
+pydantic>=2.9
+pdfplumber>=0.11
+PyMuPDF>=1.24
+httpx>=0.27
+requests>=2.32
+openpyxl>=3.1
+XlsxWriter>=3.2
+pytest>=8.3
 streamlit==1.39.0
 pandas==2.2.3
 plotly==5.24.1
