@@ -89,9 +89,12 @@ ledger: Ledger = st.session_state.ledger
 
 @st.cache_data
 def load_sources() -> list[dict]:
-    if SOURCES_PATH.exists():
-        return json.loads(SOURCES_PATH.read_text(encoding="utf-8"))
-    return []
+    if not SOURCES_PATH.exists():
+        return []
+    data = json.loads(SOURCES_PATH.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("sources", [])
+    return [s for s in data if isinstance(s, dict)]
 
 
 def money_total(led: Ledger, access_path: AccessPath) -> float:
