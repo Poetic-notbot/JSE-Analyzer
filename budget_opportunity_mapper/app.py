@@ -9,6 +9,9 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from budget_mapper.ingest import download_pdf, extract_pdf_text, find_money_near_terms
 from budget_mapper.profiles.jamaica_fy2026_27 import build_verified_seed_ledger
 from budget_mapper.visuals import sunburst, treemap, reconciliation_bar
