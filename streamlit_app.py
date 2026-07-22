@@ -761,8 +761,47 @@ def _render_ingestion_preview(ctx: Context, content: bytes, filename: str,
             st.info("Import rejected. Nothing was written to fact tables.")
 
 
+def _data_status(ctx: Context) -> dict:
+    r = ctx.repo
+    def counts(table):
+        off = r.scalar(f"SELECT COUNT(*) FROM {table} WHERE provenance LIKE 'official%'") or 0
+        ill = r.scalar(f"SELECT COUNT(*) FROM {table} WHERE provenance='illustrative'") or 0
+        return off, ill
+    prod_off, prod_ill = counts("production_records")
+    price_off, price_ill = counts("price_records")
+    area_off = r.scalar("SELECT COUNT(*) FROM area_reaped_records WHERE provenance LIKE 'official%'") or 0
+    crops_official = r.scalar(
+        "SELECT COUNT(DISTINCT crop_id) FROM production_records WHERE provenance LIKE 'official%'") or 0
+    return {"prod_off": prod_off, "prod_ill": prod_ill, "area_off": area_off,
+            "price_off": price_off, "price_ill": price_ill,
+            "crops_official": crops_official}
+
+
 def page_admin(ctx: Context) -> None:
     ui.section("Administration", "Official-file ingestion & data stewardship")
+
+    ds = _data_status(ctx)
+    st.markdown("#### Current data status")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Production rows (official)", ds["prod_off"],
+              f"{ds['prod_ill']} illustrative")
+    s2.metric("Area rows (official)", ds["area_off"])
+    s3.metric("Price rows (official)", ds["price_off"],
+              f"{ds['price_ill']} illustrative")
+    s4.metric("Crops on official data", ds["crops_official"])
+    if ds["prod_off"] == 0 and ds["price_off"] == 0:
+        st.warning("No official rows yet — everything shown app-wide is "
+                   "**illustrative seed data**. Fetch/upload a file below and click "
+                   "**Approve & commit**. Note: on Streamlit Community Cloud this "
+                   "resets on reboot, so commit *after* your last reboot.", icon="⚠️")
+    else:
+        st.success(f"Official data present: {ds['prod_off']} production + "
+                   f"{ds['area_off']} area + {ds['price_off']} price rows across "
+                   f"{ds['crops_official']} crops. These supersede seeds on the "
+                   "Dashboard, Calendar, Crop Explorer and Prices pages. "
+                   "(FAOSTAT provides production/area only — prices still need a "
+                   "MoA weekly XLSX or JAMIS.)", icon="✅")
+    st.divider()
     ui.honesty_note(
         "Fetch an official source directly, or upload a Ministry/RADA/JAMIS file. "
         "The parser normalizes crop names and units, flags data-quality issues, "
