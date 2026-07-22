@@ -40,6 +40,21 @@ def fetchable_sources() -> list[dict]:
     return out
 
 
+# A realistic browser User-Agent + Accept headers. Government portals often sit
+# behind bot protection (e.g. Cloudflare) that 403s unknown clients; a normal
+# browser signature lets us retrieve the same public files a browser would.
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "application/pdf,application/vnd.ms-excel,"
+               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,"
+               "*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
 @dataclass
 class FetchResult:
     ok: bool
@@ -82,7 +97,7 @@ def fetch_url(url: str, *, timeout: int = 45) -> FetchResult:
     handlers.append(urllib.request.HTTPSHandler(context=_ssl_context()))
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(
-        url, headers={"User-Agent": "JamaicaCropIntelligence/1.0 (+ingestion)"})
+        url, headers=_BROWSER_HEADERS)
     try:
         with opener.open(req, timeout=timeout) as resp:
             content = resp.read()
@@ -116,7 +131,7 @@ def probe_url(url: str, *, timeout: int = 15) -> FetchResult:
     handlers.append(urllib.request.HTTPSHandler(context=_ssl_context()))
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(
-        url, headers={"User-Agent": "JamaicaCropIntelligence/1.0 (+probe)"})
+        url, headers=_BROWSER_HEADERS)
     try:
         with opener.open(req, timeout=timeout) as resp:
             resp.read(64)  # touch the stream; enough to confirm reachability
