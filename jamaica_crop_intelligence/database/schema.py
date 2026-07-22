@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------- #
 # DDL. Ordered so that foreign-key parents are created before children.
@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS production_records (
     year          INTEGER NOT NULL,
     quarter       INTEGER CHECK (quarter BETWEEN 1 AND 4),
     tonnes        REAL,
+    original_crop_name TEXT,
+    confidence    REAL DEFAULT 1.0,
     provenance    TEXT NOT NULL DEFAULT 'illustrative',
     source_file_id INTEGER REFERENCES source_files(id),
     record_key    TEXT UNIQUE,             -- dedupe key
@@ -138,7 +140,12 @@ CREATE TABLE IF NOT EXISTS price_records (
     month         INTEGER CHECK (month BETWEEN 1 AND 12),
     price_jmd     REAL NOT NULL,
     price_per_kg_jmd REAL,                   -- normalized where convertible
-    price_type    TEXT DEFAULT 'farmgate',   -- farmgate, wholesale, retail
+    price_type    TEXT DEFAULT 'farmgate',   -- farmgate, wholesale, urban_retail, rural_retail
+    price_date    TEXT,                      -- ISO date or week-ending, when known
+    week_ending   TEXT,                      -- week-ending label from weekly workbooks
+    market_location TEXT,                    -- free-text market/location as published
+    original_crop_name TEXT,                 -- raw crop name before normalization (lineage)
+    confidence    REAL DEFAULT 1.0,          -- 0..1 ingestion confidence
     provenance    TEXT NOT NULL DEFAULT 'illustrative',
     source_file_id INTEGER REFERENCES source_files(id),
     record_key    TEXT UNIQUE,
@@ -305,6 +312,8 @@ CREATE TABLE IF NOT EXISTS source_files (
     file_hash     TEXT NOT NULL,
     kind          TEXT,                     -- prices, production, area_reaped, registry
     origin_url    TEXT,
+    source_name   TEXT,                     -- human label e.g. 'Ministry Weekly Prices', 'JAMIS'
+    retrieval     TEXT DEFAULT 'upload',    -- upload | fetch
     size_bytes    INTEGER,
     provenance    TEXT DEFAULT 'official_observed',
     uploaded_at   TEXT DEFAULT (datetime('now')),
@@ -345,9 +354,48 @@ def connect(db_path: str | Path = ":memory:") -> sqlite3.Connection:
     return conn
 
 
+# Columns added after the initial DDL. Applied idempotently so an existing DB
+# (e.g. a warm-restarted Streamlit Cloud instance) gains new columns without a
+# destructive rebuild. Each entry: (table, column, column_def).
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("price_records", "price_date", "TEXT"),
+    ("price_records", "week_ending", "TEXT"),
+    ("price_records", "market_location", "TEXT"),
+    ("price_records", "original_crop_name", "TEXT"),
+    ("price_records", "confidence", "REAL DEFAULT 1.0"),
+    ("production_records", "original_crop_name", "TEXT"),
+    ("production_records", "confidence", "REAL DEFAULT 1.0"),
+    ("area_reaped_records", "original_crop_name", "TEXT"),
+    ("area_reaped_records", "confidence", "REAL DEFAULT 1.0"),
+    ("source_files", "source_name", "TEXT"),
+    ("source_files", "retrieval", "TEXT DEFAULT 'upload'"),
+]
+
+
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {r["name"] for r in rows}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def apply_migrations(conn: sqlite3.Connection) -> None:
+    """Add any columns missing from an older database (idempotent)."""
+    for table, column, coldef in MIGRATIONS:
+        cols = _existing_columns(conn, table)
+        if cols and column not in cols:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+            except sqlite3.OperationalError:
+                pass  # already added by a concurrent connection
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Create all tables (idempotent) and stamp the schema version."""
+    """Create all tables (idempotent), apply column migrations, stamp version."""
     conn.executescript(DDL)
+    apply_migrations(conn)
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
         (str(SCHEMA_VERSION),),

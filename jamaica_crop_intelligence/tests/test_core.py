@@ -105,6 +105,26 @@ def test_supplier_rollup_and_planned_vs_actual():
     assert pva["variance_kg"] == -20
 
 
+def test_allocate_quarter_reconciles():
+    curve = core.build_supply_index([1, 2, 3])
+    alloc = core.allocate_quarter_to_months(3000.0, 1, curve)
+    assert set(alloc) == {1, 2, 3}
+    assert core.reconciles_to_quarter(alloc, 3000.0)
+    assert sum(alloc.values()) == pytest.approx(3000.0)
+
+
+def test_allocate_flat_quarter_splits_evenly():
+    flat = [0.0] * 12  # no signal in the quarter
+    alloc = core.allocate_quarter_to_months(300.0, 2, flat)
+    assert all(v == pytest.approx(100.0) for v in alloc.values())
+
+
+def test_detect_outliers_iqr():
+    assert core.detect_outliers_iqr([100, 102, 98, 101, 500]) == [4]
+    assert core.detect_outliers_iqr([1, 2, 3]) == []       # too few points
+    assert core.detect_outliers_iqr([5, 5, 5, 5]) == []    # zero IQR
+
+
 def test_threat_exposure_monotonic():
     low = core.threat_exposure_score(2, 0.2, 0.2)
     high = core.threat_exposure_score(5, 0.9, 1.0)

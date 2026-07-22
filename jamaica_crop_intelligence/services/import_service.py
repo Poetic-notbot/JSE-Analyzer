@@ -35,7 +35,9 @@ class ImportService:
 
     def register_source_file(self, filename: str, content: bytes, kind: str,
                              origin_url: str | None = None,
-                             provenance: str = "official_observed") -> tuple[int, bool]:
+                             provenance: str = "official_observed",
+                             source_name: str | None = None,
+                             retrieval: str = "upload") -> tuple[int, bool]:
         """Register a file. Returns (source_file_id, is_new). Deduped by hash."""
         h = self.file_hash(content)
         existing = self.find_by_hash(h)
@@ -43,7 +45,8 @@ class ImportService:
             return existing["id"], False
         sid = self.repo.insert("source_files", {
             "filename": filename, "file_hash": h, "kind": kind,
-            "origin_url": origin_url, "size_bytes": len(content),
+            "origin_url": origin_url, "source_name": source_name,
+            "retrieval": retrieval, "size_bytes": len(content),
             "provenance": provenance,
         }, or_ignore=True)
         if sid == 0:
@@ -53,7 +56,8 @@ class ImportService:
 
     def source_files(self) -> pd.DataFrame:
         return self.repo.df(
-            "SELECT id, filename, kind, provenance, size_bytes, origin_url, uploaded_at "
+            "SELECT id, filename, kind, source_name, retrieval, provenance, "
+            "size_bytes, origin_url, uploaded_at "
             "FROM source_files ORDER BY uploaded_at DESC")
 
     # ----------------------------------------------------------- import runs

@@ -25,24 +25,51 @@ from typing import Any
 import pandas as pd
 
 from ..calculations import core
+from . import validation
+
+
+def _infer_price_type(header: str | None) -> str:
+    """Infer price_type from a single price column's header text."""
+    low = str(header or "").lower()
+    for price_type, keywords in PRICE_TYPE_KEYWORDS:
+        if any(kw in low for kw in keywords):
+            return price_type
+    return "farmgate"
 
 # --------------------------------------------------------------------------- #
 # Column keyword maps (lowercased substring match against header cells).
 # --------------------------------------------------------------------------- #
 COLUMN_KEYWORDS = {
-    "crop": ["crop", "commodity", "product", "item"],
+    "crop": ["crop", "commodity", "product", "item", "produce"],
     "parish": ["parish"],
     "year": ["year", "yr"],
     "quarter": ["quarter", "qtr", "q"],
     "month": ["month", "mth"],
-    "price": ["price", "cost", "value", "j$", "jmd", "farmgate", "rate"],
+    "date": ["date", "week ending", "week-ending", "week_ending", "weekending",
+             "period", "week"],
+    "price": ["price", "cost", "value", "j$", "jmd", "farmgate", "rate", "$"],
     "tonnes": ["tonne", "tonnes", "production", "output", "mt", "metric ton"],
     "hectares": ["hectare", "hectares", "ha", "area", "reaped"],
     "farmers": ["farmer", "farmers", "count", "growers"],
     "unit": ["unit", "uom", "measure"],
+    "market": ["market", "location", "outlet"],
 }
 
+# Price-type columns as published by the Ministry / JAMIS price chain. Order
+# matters: more specific labels first so 'urban retail' beats bare 'retail'.
+PRICE_TYPE_KEYWORDS = [
+    ("farmgate", ["farmgate", "farm gate", "farm-gate", "farmer"]),
+    ("wholesale", ["wholesale", "whole sale"]),
+    ("urban_retail", ["urban retail", "urban", "kingston retail"]),
+    ("rural_retail", ["rural retail", "rural"]),
+    ("retail", ["retail"]),
+]
+
 QUARTER_RE = re.compile(r"q?\s*([1-4])", re.IGNORECASE)
+_DATE_RE = re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})|(\d{1,2})[-/](\d{1,2})[-/](\d{4})")
+_MONTHS_ABBR = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+     "nov", "dec"], start=1)}
 
 
 # --------------------------------------------------------------------------- #
@@ -122,6 +149,65 @@ def detect_columns(df: pd.DataFrame) -> dict[str, str | None]:
                 mapping[field] = col
                 break
     return mapping
+
+
+def detect_price_type_columns(df: pd.DataFrame) -> dict[str, str]:
+    """Detect wide price-type columns -> {price_type: column_name}.
+
+    Handles Ministry/JAMIS workbooks that publish farmgate / wholesale /
+    urban-retail / rural-retail as separate columns in one sheet.
+    """
+    found: dict[str, str] = {}
+    claimed: set[str] = set()
+    for price_type, keywords in PRICE_TYPE_KEYWORDS:
+        for col in df.columns:
+            if col in claimed:
+                continue
+            low = str(col).lower()
+            if any(kw in low for kw in keywords):
+                found[price_type] = col
+                claimed.add(col)
+                break
+    return found
+
+
+def _parse_date(val: Any) -> str | None:
+    """Best-effort parse of a date / week-ending cell to ISO 'YYYY-MM-DD'."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "nat"):
+        return None
+    m = _DATE_RE.search(s)
+    if m:
+        if m.group(1):
+            y, mo, d = m.group(1), m.group(2), m.group(3)
+        else:
+            d, mo, y = m.group(4), m.group(5), m.group(6)
+        try:
+            return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        except ValueError:
+            return None
+    # 'Mar 2024' / '2024 Mar'
+    low = s.lower()
+    for name, num in _MONTHS_ABBR.items():
+        if name in low:
+            ym = re.search(r"(20\d{2})", low)
+            if ym:
+                return f"{int(ym.group(1)):04d}-{num:02d}-01"
+    return None
+
+
+def _year_from_date(iso: str | None) -> int | None:
+    if iso and len(iso) >= 4 and iso[:4].isdigit():
+        return int(iso[:4])
+    return None
+
+
+def _quarter_from_date(iso: str | None) -> int | None:
+    if iso and len(iso) >= 7 and iso[5:7].isdigit():
+        return core.quarter_of_month(int(iso[5:7]))
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -256,65 +342,123 @@ def parse_file(content: bytes, filename: str, kind: str, repo) -> dict:
     unmatched_crops: dict[str, str | None] = {}
     unknown_units: set[str] = set()
 
+    date_col = cols.get("date")
+    market_col = cols.get("market")
+    unit_col = cols.get("unit")
+    reserved = {cols.get(k) for k in
+                ("crop", "date", "market", "unit", "parish", "year",
+                 "quarter", "month")}
+    price_type_cols: dict[str, str] = {}
+    if kind == "prices":
+        price_type_cols = {pt: c for pt, c in detect_price_type_columns(df).items()
+                           if c not in reserved}
+    result["price_type_columns"] = price_type_cols
+
+    def _resolve_kg_eq(raw_unit_val: Any) -> float | None:
+        ru = _norm(raw_unit_val)
+        if ru and ru not in ("nan", ""):
+            if ru in unit_map:
+                return unit_map[ru][1]
+            unknown_units.add(str(raw_unit_val))
+        return None
+
     for _, r in df.iterrows():
         raw_crop = r.get(cols["crop"])
-        if raw_crop is None or _norm(raw_crop) in ("", "nan", "total"):
+        if raw_crop is None or _norm(raw_crop) in ("", "nan", "total", "all crops"):
             continue
         crop_id, suggestion = normalize_crop(raw_crop, alias_map, canonical)
         if crop_id is None:
             unmatched_crops[str(raw_crop)] = suggestion
             continue
 
+        iso = _parse_date(r.get(date_col)) if date_col else None
         year = _to_int(r.get(cols["year"])) if cols.get("year") else None
+        if year is None:
+            year = _year_from_date(iso)
         quarter = _parse_quarter(r.get(cols["quarter"])) if cols.get("quarter") else None
+        if quarter is None:
+            quarter = _quarter_from_date(iso)
         parish = (str(r.get(cols["parish"])).strip()
                   if cols.get("parish") and pd.notna(r.get(cols["parish"])) else None)
+        market_location = (str(r.get(market_col)).strip()
+                           if market_col and pd.notna(r.get(market_col)) else None)
+        week_ending = (str(r.get(date_col)).strip()
+                       if date_col and pd.notna(r.get(date_col)) else None)
 
-        row: dict[str, Any] = {"crop_id": crop_id, "crop_raw": str(raw_crop),
-                               "year": year, "quarter": quarter, "parish": parish}
-
-        if kind == "prices":
-            price = _to_float(r.get(cols["price"])) if cols.get("price") else None
-            if price is None:
-                continue
-            kg_eq = None
-            if cols.get("unit"):
-                raw_unit = _norm(r.get(cols["unit"]))
-                if raw_unit and raw_unit not in ("nan", ""):
-                    if raw_unit in unit_map:
-                        kg_eq = unit_map[raw_unit][1]
-                    else:
-                        unknown_units.add(str(r.get(cols["unit"])))
-            row["price_jmd"] = price
-            row["price_per_kg_jmd"] = (core.to_price_per_kg(price, kg_eq)
-                                       if kg_eq else price)
-            row["price_type"] = "farmgate"
-        elif kind == "production":
-            tonnes = _to_float(r.get(cols["tonnes"])) if cols.get("tonnes") else None
-            if tonnes is None:
-                continue
-            row["tonnes"] = tonnes
-        elif kind == "area_reaped":
-            ha = _to_float(r.get(cols["hectares"])) if cols.get("hectares") else None
-            if ha is None:
-                continue
-            row["hectares"] = ha
-        elif kind == "registry":
-            row["farmer_count"] = _to_int(r.get(cols["farmers"])) if cols.get("farmers") else None
-            row["registered_hectares"] = (_to_float(r.get(cols["hectares"]))
-                                          if cols.get("hectares") else None)
-            if parish is None:
-                continue
-
-        # Range sanity flags.
         if year is not None and not (2000 <= year <= 2100):
             result["quality_issues"].append(
                 {"severity": "warning", "category": "range",
                  "detail": f"Suspicious year {year} for {raw_crop}",
                  "raw_value": str(year)})
-        rows.append(row)
+
+        base: dict[str, Any] = {
+            "crop_id": crop_id, "crop_raw": str(raw_crop),
+            "original_crop_name": str(raw_crop), "year": year,
+            "quarter": quarter, "parish": parish, "price_date": iso,
+            "week_ending": week_ending, "market_location": market_location,
+        }
+
+        if kind == "prices":
+            kg_eq = _resolve_kg_eq(r.get(unit_col)) if unit_col else None
+            if price_type_cols:  # wide: one row per published price type
+                for price_type, pcol in price_type_cols.items():
+                    price = _to_float(r.get(pcol))
+                    if price is None:
+                        continue
+                    row = dict(base)
+                    row["price_jmd"] = price
+                    row["price_per_kg_jmd"] = (core.to_price_per_kg(price, kg_eq)
+                                               if kg_eq else price)
+                    row["price_type"] = price_type
+                    row["confidence"] = 1.0 if kg_eq else 0.7
+                    rows.append(row)
+            else:
+                price = _to_float(r.get(cols["price"])) if cols.get("price") else None
+                if price is None:
+                    continue
+                row = dict(base)
+                row["price_jmd"] = price
+                row["price_per_kg_jmd"] = (core.to_price_per_kg(price, kg_eq)
+                                           if kg_eq else price)
+                row["price_type"] = _infer_price_type(cols.get("price"))
+                row["confidence"] = 1.0 if kg_eq else 0.7
+                rows.append(row)
+        elif kind == "production":
+            tonnes = _to_float(r.get(cols["tonnes"])) if cols.get("tonnes") else None
+            if tonnes is None:
+                continue
+            row = dict(base)
+            row["tonnes"] = tonnes
+            row["confidence"] = 1.0
+            rows.append(row)
+        elif kind == "area_reaped":
+            ha = _to_float(r.get(cols["hectares"])) if cols.get("hectares") else None
+            if ha is None:
+                continue
+            row = dict(base)
+            row["hectares"] = ha
+            row["confidence"] = 1.0
+            rows.append(row)
+        elif kind == "registry":
+            if parish is None:
+                continue
+            row = dict(base)
+            row["farmer_count"] = _to_int(r.get(cols["farmers"])) if cols.get("farmers") else None
+            row["registered_hectares"] = (_to_float(r.get(cols["hectares"]))
+                                          if cols.get("hectares") else None)
+            rows.append(row)
 
     normalized = pd.DataFrame(rows)
+
+    # Data-quality validation (drops invalid rows, appends flags).
+    if kind == "prices":
+        normalized, vflags = validation.validate_price_rows(normalized)
+        result["quality_issues"].extend(vflags)
+    elif kind in ("production", "area_reaped"):
+        vcol = "tonnes" if kind == "production" else "hectares"
+        normalized, vflags = validation.validate_quantity_rows(normalized, vcol)
+        result["quality_issues"].extend(vflags)
+
     result["normalized"] = normalized
     result["crop_review"] = [{"raw": k, "suggestion": v}
                              for k, v in sorted(unmatched_crops.items())]
@@ -351,7 +495,12 @@ def _record_key(kind: str, row: dict) -> str:
     q = row.get("quarter")
     parish = row.get("parish") or "allisland"
     if kind == "prices":
-        return f"price:{cid}:{y}:{q}:{row.get('price_type', 'farmgate')}:{parish}"
+        # Include date/week and market so weekly rows in the same quarter and
+        # different markets do not collapse into one another.
+        when = row.get("price_date") or row.get("week_ending") or f"{y}Q{q}"
+        market = row.get("market_location") or "na"
+        return (f"price:{cid}:{y}:{q}:{row.get('price_type', 'farmgate')}:"
+                f"{parish}:{market}:{when}")
     if kind == "production":
         return f"prod:{cid}:{y}:{q}:{parish}"
     if kind == "area_reaped":
@@ -383,6 +532,11 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
                 "price_jmd": row["price_jmd"],
                 "price_per_kg_jmd": row.get("price_per_kg_jmd"),
                 "price_type": row.get("price_type", "farmgate"),
+                "price_date": row.get("price_date"),
+                "week_ending": row.get("week_ending"),
+                "market_location": row.get("market_location"),
+                "original_crop_name": row.get("original_crop_name"),
+                "confidence": row.get("confidence", 1.0),
                 "provenance": "official_observed",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
@@ -390,14 +544,20 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
             repo.insert("production_records", {
                 "crop_id": row["crop_id"], "parish": row.get("parish"),
                 "year": row.get("year"), "quarter": row.get("quarter"),
-                "tonnes": row["tonnes"], "provenance": "official_observed",
+                "tonnes": row["tonnes"],
+                "original_crop_name": row.get("original_crop_name"),
+                "confidence": row.get("confidence", 1.0),
+                "provenance": "official_observed",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
         elif kind == "area_reaped":
             repo.insert("area_reaped_records", {
                 "crop_id": row["crop_id"], "parish": row.get("parish"),
                 "year": row.get("year"), "quarter": row.get("quarter"),
-                "hectares": row["hectares"], "provenance": "official_observed",
+                "hectares": row["hectares"],
+                "original_crop_name": row.get("original_crop_name"),
+                "confidence": row.get("confidence", 1.0),
+                "provenance": "official_observed",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
         elif kind == "registry":

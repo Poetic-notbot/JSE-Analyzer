@@ -82,6 +82,63 @@ def peak_months(curve: Sequence[float], threshold: float = 0.999) -> list[int]:
     return [i + 1 for i, v in enumerate(curve) if v >= threshold * hi]
 
 
+def allocate_quarter_to_months(
+    quarter_total: float,
+    quarter: int,
+    supply_curve: Sequence[float],
+) -> dict[int, float]:
+    """Allocate an OBSERVED quarterly total across its 3 months by the modelled
+    supply shape. Result is a modelled estimate that, by construction,
+    **reconciles** to the quarter (the three months sum back to the total).
+
+    Returns {month: allocated_value}. If the curve is flat/zero over the
+    quarter, the total is split evenly.
+    """
+    months = months_of_quarter(quarter)
+    if len(supply_curve) != 12:
+        raise ValueError("supply_curve must have 12 entries")
+    weights = [max(0.0, supply_curve[m - 1]) for m in months]
+    wsum = sum(weights)
+    if wsum <= 0:
+        weights = [1.0, 1.0, 1.0]
+        wsum = 3.0
+    return {m: quarter_total * w / wsum for m, w in zip(months, weights)}
+
+
+def reconciles_to_quarter(
+    monthly: Mapping[int, float],
+    quarter_total: float,
+    *,
+    tol: float = 1e-6,
+) -> bool:
+    """True if a monthly allocation sums back to the quarterly total (± tol)."""
+    return abs(sum(monthly.values()) - quarter_total) <= tol * max(1.0, abs(quarter_total))
+
+
+def detect_outliers_iqr(values: Sequence[float], *, k: float = 1.5) -> list[int]:
+    """Return indices of values outside [Q1 - k*IQR, Q3 + k*IQR]. <4 pts -> none."""
+    vals = [(i, float(v)) for i, v in enumerate(values) if v is not None]
+    if len(vals) < 4:
+        return []
+    s = sorted(v for _, v in vals)
+    n = len(s)
+
+    def _pct(p: float) -> float:
+        idx = p * (n - 1)
+        lo = int(idx)
+        frac = idx - lo
+        if lo + 1 < n:
+            return s[lo] + frac * (s[lo + 1] - s[lo])
+        return s[lo]
+
+    q1, q3 = _pct(0.25), _pct(0.75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return []
+    low, high = q1 - k * iqr, q3 + k * iqr
+    return [i for i, v in vals if v < low or v > high]
+
+
 def seasonality_availability(curve: Sequence[float], month: int) -> float:
     """Availability weight for a given 1-indexed month."""
     if not 1 <= month <= 12:

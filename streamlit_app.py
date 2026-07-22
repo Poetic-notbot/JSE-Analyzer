@@ -21,6 +21,7 @@ from jamaica_crop_intelligence import __version__
 from jamaica_crop_intelligence.components import ui
 from jamaica_crop_intelligence.config import settings
 from jamaica_crop_intelligence.exports import excel_export
+from jamaica_crop_intelligence.ingestion import official_fetch
 from jamaica_crop_intelligence.services.import_service import ImportService
 from jamaica_crop_intelligence.services.price_service import PriceService
 from jamaica_crop_intelligence.services.procurement_integration_service import (
@@ -244,28 +245,85 @@ def page_parish(ctx: Context) -> None:
 
 
 def page_prices(ctx: Context) -> None:
-    ui.section("Prices", "Farmgate JMD/kg - illustrative until official files ingested")
+    ui.section("Prices", "Farmgate / wholesale / retail JMD/kg — observed where ingested")
+
+    # Refresh + source banner (honest about provenance).
+    refresh = ctx.prices.last_refresh()
+    if refresh:
+        prov = refresh.get("provenance", "illustrative")
+        src = refresh.get("source_name") or refresh.get("origin_url") or "seed data"
+        st.markdown(
+            f"Data as of **{refresh.get('as_of', '—')}** · source: {src} · "
+            + ui.provenance_badge(prov), unsafe_allow_html=True)
+        if prov == "illustrative":
+            st.caption("No official price files ingested yet — showing illustrative "
+                       "seeds. Fetch or upload official files on the Administration page.")
+
     latest = ctx.prices.latest_prices()
     if not latest.empty:
-        st.markdown("**Latest quarter, JMD/kg**")
+        st.markdown("**Latest period, JMD/kg (all crops)**")
         fig = px.bar(latest.head(20), x="price_jmd_per_kg", y="crop", orientation="h",
                      color="price_jmd_per_kg", color_continuous_scale="Blues")
-        fig.update_layout(height=520, yaxis={"categoryorder": "total ascending"},
+        fig.update_layout(height=480, yaxis={"categoryorder": "total ascending"},
                           coloraxis_showscale=False, margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(fig, use_container_width=True)
-        prov = latest["provenance"].iloc[0]
-        st.markdown(ui.provenance_badge(prov), unsafe_allow_html=True)
 
     st.divider()
     crop_id, crop_name = crop_selector(ctx, "price_crop")
-    series = ctx.prices.price_series(crop_id)
-    if not series.empty:
-        fig = px.line(series, x="period", y="price_per_kg_jmd", markers=True,
-                      title=f"{crop_name} farmgate price trend (JMD/kg)")
-        fig.update_layout(height=320)
+
+    # Dynamic filters (populated from whatever data is present).
+    ptypes = ctx.prices.distinct_price_types(crop_id) or ["farmgate"]
+    markets = ctx.prices.distinct_markets(crop_id)
+    c1, c2 = st.columns(2)
+    ptype = c1.selectbox("Price type", ["(all)"] + ptypes, key="ptype")
+    market = c2.selectbox("Market / location", ["(all)"] + markets, key="pmkt") if markets else "(all)"
+    ptype_f = None if ptype == "(all)" else ptype
+    market_f = None if market == "(all)" else market
+
+    frame = ctx.prices.price_frame(crop_id, price_type=ptype_f, market=market_f)
+
+    # Change metrics.
+    metrics = ctx.prices.change_metrics(crop_id, price_type=ptype_f)
+    stats = ctx.prices.statistics(crop_id)
+    if metrics:
+        delta = (f"{metrics['change_pct']:+.1f}% vs prev"
+                 if "change_pct" in metrics else None)
+        ui.kpi_row([
+            (f"Latest ({metrics.get('latest_period', '—')})",
+             f"{metrics['latest_jmd_per_kg']:.0f} JMD/kg", delta),
+            ("Mean JMD/kg", f"{stats['mean']:.0f}", None),
+            ("Min–Max", f"{stats['min']:.0f}–{stats['max']:.0f}", None),
+            ("Volatility (CV)", f"{stats['cv']:.2f}", None),
+        ])
+
+    if not frame.empty:
+        agg = frame.groupby(["period_label", "price_type"], as_index=False)[
+            "price_per_kg_jmd"].mean()
+        fig = px.line(agg, x="period_label", y="price_per_kg_jmd", color="price_type",
+                      markers=True, title=f"{crop_name} price trend (JMD/kg)")
+        fig.update_layout(height=340, xaxis_title="", legend_title="price type")
         st.plotly_chart(fig, use_container_width=True)
-    ui.provenance_table(series[["crop", "year", "quarter", "price_per_kg_jmd",
-                                "price_type", "provenance"]] if not series.empty else series)
+
+    # Farmgate -> retail spread, when more than one price type exists.
+    spread = ctx.prices.spread_frame(crop_id)
+    if not spread.empty and "spread_jmd_per_kg" in spread.columns:
+        st.markdown("**Farmgate → retail spread**")
+        fig = px.bar(spread, x="period_label", y="spread_jmd_per_kg",
+                     hover_data=[c for c in spread.columns
+                                 if c not in ("period_label", "spread_jmd_per_kg")])
+        fig.update_layout(height=260, xaxis_title="", yaxis_title="JMD/kg spread",
+                          margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Spread = dearest price type minus farmgate. A widening spread "
+                   "means retail is decoupling from farmgate — a procurement signal.")
+    elif len(ptypes) <= 1:
+        st.caption("Only one price type present. Ingest a Ministry/JAMIS weekly "
+                   "workbook with farmgate/wholesale/retail columns to see spreads.")
+
+    if not frame.empty:
+        ui.provenance_table(frame[["period_label", "price_type", "market_location",
+                                   "price_per_kg_jmd", "provenance"]].rename(
+            columns={"price_per_kg_jmd": "JMD/kg"}))
 
 
 def page_threats(ctx: Context) -> None:
@@ -519,6 +577,23 @@ def page_methodology(ctx: Context) -> None:
     st.caption("Some hosts may be unreachable under a restricted network policy; "
                "the same files can be uploaded manually on the Administration page.")
 
+    st.markdown("#### Live data ingestion")
+    st.markdown(
+        "- **Auto-fetch adapter** pulls official file URLs directly where the "
+        "network allows (e.g. Streamlit Cloud), and **fails gracefully** with a "
+        "clear reason where a host is blocked - never fabricating data.\n"
+        "- **Weekly workbooks**: farmgate / wholesale / urban-retail / rural-retail "
+        "columns are melted into typed `price_records`; dates and markets are "
+        "captured as **lineage** (`price_date`, `week_ending`, `market_location`, "
+        "`original_crop_name`, `confidence`).\n"
+        "- **Data-quality checks**: non-positive prices are dropped, IQR outliers "
+        "and suspected unit mismatches are flagged into `data_quality_flags`.\n"
+        "- **Idempotent commits** deduped by a deterministic `record_key` including "
+        "date and market, so re-fetching the same file writes nothing new.\n"
+        "- The **Prices** page shows farmgate→retail spreads, period-on-period "
+        "change, volatility and an as-of/source label from the latest observation."
+    )
+
     st.markdown("#### Modelled relationships")
     st.markdown(
         "- **Supply index**: peak=1.0 at harvest months, shoulder weight in "
@@ -530,71 +605,110 @@ def page_methodology(ctx: Context) -> None:
     st.caption(f"App version {__version__}. Legacy JSE stock analyzer remains at app.py.")
 
 
+def _render_ingestion_preview(ctx: Context, content: bytes, filename: str,
+                              kind: str, sfid: int, key_prefix: str) -> None:
+    """Shared preview + approve/reject UI for both upload and fetch paths."""
+    preview = ctx.imports.preview(content, filename, kind)
+    summary = preview["summary"]
+
+    cols = st.columns(5)
+    cols[0].metric("Rows in file", summary.get("rows_in_file", 0))
+    cols[1].metric("Normalized", summary.get("rows_normalized", 0))
+    cols[2].metric("Unmatched crops", summary.get("unmatched_crops", 0))
+    cols[3].metric("Unknown units", summary.get("unknown_units", 0))
+    cols[4].metric("Quality flags", summary.get("quality_issues", 0))
+
+    st.markdown("**Detected columns**")
+    st.json({k: v for k, v in preview["columns_detected"].items() if v})
+    if preview.get("price_type_columns"):
+        st.caption("Price-type columns detected: "
+                   + ", ".join(preview["price_type_columns"]))
+
+    if preview["crop_review"]:
+        st.markdown("**Crop-name review** (unmatched → suggestion)")
+        st.dataframe(pd.DataFrame(preview["crop_review"]),
+                     use_container_width=True, hide_index=True)
+    if preview["unit_review"]:
+        st.markdown("**Unit review** (unknown units)")
+        st.write(preview["unit_review"])
+
+    if not preview["normalized"].empty:
+        st.markdown("**Normalized preview** (with lineage: original name, date, market)")
+        st.dataframe(preview["normalized"].head(30),
+                     use_container_width=True, hide_index=True)
+
+    if preview["quality_issues"]:
+        with st.expander(f"Data-quality flags ({len(preview['quality_issues'])})"):
+            st.dataframe(pd.DataFrame(preview["quality_issues"]),
+                         use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Approve & commit", type="primary", key=f"{key_prefix}_commit",
+                     disabled=preview["normalized"].empty):
+            res = ctx.imports.commit_preview(
+                sfid, kind, preview["normalized"], preview["quality_issues"])
+            st.success(f"Committed {res['rows_committed']} rows "
+                       f"({res['rows_skipped']} duplicates skipped).")
+    with c2:
+        reason = st.text_input("Reject reason", "layout not recognised",
+                               key=f"{key_prefix}_reason")
+        if st.button("❌ Reject", key=f"{key_prefix}_reject"):
+            ctx.imports.reject_preview(sfid, kind,
+                                       summary.get("rows_normalized", 0), reason)
+            st.info("Import rejected. Nothing was written to fact tables.")
+
+
 def page_admin(ctx: Context) -> None:
     ui.section("Administration", "Official-file ingestion & data stewardship")
     ui.honesty_note(
-        "Upload an official Ministry/RADA file. The parser normalizes crop "
-        "names and units, flags data-quality issues, and lets you approve or "
-        "reject before anything is written. Commits are idempotent (deduped by "
-        "record key).")
+        "Fetch an official source directly, or upload a Ministry/RADA/JAMIS file. "
+        "The parser normalizes crop names and units, flags data-quality issues, "
+        "and lets you approve or reject before anything is written. Commits are "
+        "idempotent (deduped by record key) and carry full lineage.")
 
-    kind = st.selectbox("File kind",
-                        ["prices", "production", "area_reaped", "registry"])
-    uploaded = st.file_uploader("Upload CSV / Excel / PDF",
-                                type=["csv", "xlsx", "xls", "pdf", "txt"])
+    fetch_tab, upload_tab = st.tabs(["Auto-fetch official source", "Upload file"])
 
-    if uploaded is not None:
-        content = uploaded.getvalue()
-        sfid, is_new = ctx.imports.register_source_file(
-            uploaded.name, content, kind)
-        if not is_new:
-            st.warning("This exact file was already registered (hash match). "
-                       "Re-committing is safe and idempotent.")
-        preview = ctx.imports.preview(content, uploaded.name, kind)
-        summary = preview["summary"]
+    # ---------------------------------------------------------------- fetch
+    with fetch_tab:
+        sources = official_fetch.fetchable_sources()
+        labels = {f"{s['name']}  ·  {s['kind']}": s for s in sources}
+        pick = st.selectbox("Official source", list(labels), key="fetch_src")
+        chosen = labels[pick]
+        st.caption(f"URL: {chosen['url']}")
+        if st.button("⤵️ Fetch now", key="do_fetch"):
+            with st.spinner("Fetching…"):
+                out = official_fetch.fetch_and_preview(ctx.imports, chosen)
+            st.session_state["fetch_out"] = out
+        out = st.session_state.get("fetch_out")
+        if out is not None:
+            res = out["fetch"]
+            if not out["ok"]:
+                st.error(f"Fetch failed: {res.error}")
+                st.caption("This is expected where the host is blocked by the "
+                           "network/egress policy. Deploy where the network allows, "
+                           "or use the Upload tab with a downloaded copy.")
+            else:
+                st.success(f"Fetched {res.filename} ({res.size:,} bytes) "
+                           + ("— new file." if out["is_new"] else "— already registered."))
+                _render_ingestion_preview(ctx, res.content, res.filename,
+                                          chosen["kind"], out["source_file_id"], "fetch")
 
-        cols = st.columns(5)
-        cols[0].metric("Rows in file", summary.get("rows_in_file", 0))
-        cols[1].metric("Normalized", summary.get("rows_normalized", 0))
-        cols[2].metric("Unmatched crops", summary.get("unmatched_crops", 0))
-        cols[3].metric("Unknown units", summary.get("unknown_units", 0))
-        cols[4].metric("Quality flags", summary.get("quality_issues", 0))
-
-        st.markdown("**Detected columns**")
-        st.json({k: v for k, v in preview["columns_detected"].items() if v})
-
-        if preview["crop_review"]:
-            st.markdown("**Crop-name review** (unmatched -> suggestion)")
-            st.dataframe(pd.DataFrame(preview["crop_review"]),
-                         use_container_width=True, hide_index=True)
-        if preview["unit_review"]:
-            st.markdown("**Unit review** (unknown units)")
-            st.write(preview["unit_review"])
-
-        if not preview["normalized"].empty:
-            st.markdown("**Normalized preview**")
-            st.dataframe(preview["normalized"].head(30),
-                         use_container_width=True, hide_index=True)
-
-        if preview["quality_issues"]:
-            with st.expander(f"Data-quality flags ({len(preview['quality_issues'])})"):
-                st.dataframe(pd.DataFrame(preview["quality_issues"]),
-                             use_container_width=True, hide_index=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✅ Approve & commit", type="primary",
-                         disabled=preview["normalized"].empty):
-                res = ctx.imports.commit_preview(
-                    sfid, kind, preview["normalized"], preview["quality_issues"])
-                st.success(f"Committed {res['rows_committed']} rows "
-                           f"({res['rows_skipped']} duplicates skipped).")
-        with c2:
-            reason = st.text_input("Reject reason", "layout not recognised")
-            if st.button("❌ Reject"):
-                ctx.imports.reject_preview(sfid, kind,
-                                           summary.get("rows_normalized", 0), reason)
-                st.info("Import rejected. Nothing was written to fact tables.")
+    # --------------------------------------------------------------- upload
+    with upload_tab:
+        kind = st.selectbox("File kind",
+                            ["prices", "production", "area_reaped", "registry"],
+                            key="upload_kind")
+        uploaded = st.file_uploader("Upload CSV / Excel / PDF",
+                                    type=["csv", "xlsx", "xls", "pdf", "txt"])
+        if uploaded is not None:
+            content = uploaded.getvalue()
+            sfid, is_new = ctx.imports.register_source_file(
+                uploaded.name, content, kind, retrieval="upload")
+            if not is_new:
+                st.warning("This exact file was already registered (hash match). "
+                           "Re-committing is safe and idempotent.")
+            _render_ingestion_preview(ctx, content, uploaded.name, kind, sfid, "upload")
 
     st.divider()
     st.markdown("#### Source files")

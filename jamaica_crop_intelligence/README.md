@@ -73,24 +73,43 @@ ephemeral, so the DB is created and **re-seeded on each cold start**; set
 
 ## Official-data ingestion (end to end)
 
-On the **Administration** page:
+On the **Administration** page, two paths feed the same pipeline:
 
-1. Pick the file **kind** (`prices`, `production`, `area_reaped`, `registry`).
-2. Upload a CSV / Excel / PDF (the file is hashed and deduped against
-   `source_files`).
-3. The parser fuzzy-detects columns (resilient to Ministry layout changes),
-   **normalizes crop names** against canonical names + aliases, **maps units**
-   (converting prices to /kg where mass-convertible), and raises
-   **data-quality flags** (unmatched crops with suggestions, unknown units,
-   range checks).
-4. Review the normalized preview, crop/unit review lists, and flags.
-5. **Approve** to commit into normalized fact tables — commits are **idempotent**
-   (deduped by deterministic `record_key`) — or **Reject** to write nothing.
-   Every step is logged into `import_runs` and `data_quality_flags`.
+**Auto-fetch** (`ingestion/official_fetch.py`) — pick an official source and
+**Fetch now**. The adapter downloads the file over HTTPS, honouring an
+environment proxy + CA bundle where present, and **fails gracefully** with a
+clear reason if a host is blocked (never fabricating data). It works directly
+where the network allows (e.g. Streamlit Community Cloud).
+
+**Upload** — drop a CSV / Excel / PDF for the chosen kind.
+
+Both then run:
+
+1. File hashed and deduped against `source_files` (records `source_name`,
+   `retrieval` = fetch/upload, `origin_url`).
+2. Parser fuzzy-detects columns (resilient to layout changes) and handles
+   **weekly workbooks** with multiple price-type columns (farmgate / wholesale /
+   urban-retail / rural-retail), melting them into typed rows; parses
+   **dates / week-ending** and **markets**.
+3. **Normalizes crop names** against canonical names + aliases; **maps units**
+   (prices to /kg where mass-convertible); captures **lineage**
+   (`original_crop_name`, `price_date`, `week_ending`, `market_location`,
+   `confidence`).
+4. **Data-quality validation** (`ingestion/validation.py`): drops non-positive
+   values, flags IQR outliers and suspected unit mismatches into
+   `data_quality_flags`.
+5. Review preview + crop/unit review lists + flags, then **Approve** (idempotent
+   commit deduped by `record_key` incl. date + market) or **Reject** (writes
+   nothing). Everything is logged into `import_runs` and `data_quality_flags`.
+
+The schema self-migrates: new lineage columns are added to an existing database
+via idempotent `ALTER TABLE` on startup (`database/schema.apply_migrations`), so
+a warm-restarted deployment is never left on a stale schema.
 
 > Note: some official hosts may be unreachable under a restricted network
-> policy. The same files can always be downloaded by the user and uploaded
-> manually here. See [`output/source_register.md`](../output/source_register.md).
+> policy (the build sandbox blocks moa.gov.jm / data.gov.jm). Auto-fetch reports
+> this honestly; the same files can be downloaded and uploaded instead. See
+> [`output/source_register.md`](../output/source_register.md).
 
 ## Modelled relationships
 
