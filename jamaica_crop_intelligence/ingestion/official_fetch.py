@@ -23,6 +23,9 @@ truth: a certificate-trust failure is NOT a network block. Classes:
 from __future__ import annotations
 
 import os
+import re
+import tempfile
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -30,6 +33,17 @@ import certifi
 import requests
 
 from ..config import settings
+
+# Cloudflare/origin errors that are typically transient -> worth a retry.
+_RETRY_STATUS = {502, 503, 504, 521, 522, 523, 524}
+_SYSTEM_CA_PATHS = (
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian/Ubuntu (Streamlit Cloud)
+    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL/CentOS
+    "/etc/ssl/cert.pem",                    # Alpine/macOS
+)
+_CERT_BLOCK = re.compile(
+    r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
+_combined_bundle_path: str | None = None
 
 # Sources that are directly fetchable files (not portal landing pages).
 FETCHABLE_KINDS = {"prices", "production", "area_reaped", "registry"}
@@ -66,6 +80,48 @@ def ca_bundle() -> str:
         if p and os.path.exists(p):
             return p
     return certifi.where()
+
+
+def combined_ca_bundle() -> str:
+    """Build a CA bundle merging certifi + the OS trust store (+ env bundles).
+
+    Some government hosts verify against the *system* store but not certifi
+    alone (e.g. data.gov.jm), while others need a *fresh* certifi that a stale
+    system store lacks (e.g. moa.gov.jm). Merging both maximizes the chance of
+    building a valid chain — every anchor is a legitimate CA, verification is
+    never disabled. Cached to a temp file after the first build.
+    """
+    global _combined_bundle_path
+    if _combined_bundle_path and os.path.exists(_combined_bundle_path):
+        return _combined_bundle_path
+
+    paths: list[str] = [certifi.where()]
+    for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"):
+        p = os.environ.get(var)
+        if p:
+            paths.append(p)
+    paths.extend(_SYSTEM_CA_PATHS)
+
+    seen: set[str] = set()
+    blocks: list[str] = []
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                with open(p, "r", errors="ignore") as fh:
+                    for block in _CERT_BLOCK.findall(fh.read()):
+                        key = block.strip()
+                        if key and key not in seen:
+                            seen.add(key)
+                            blocks.append(key)
+        except OSError:
+            continue
+    if not blocks:
+        return certifi.where()
+    fd, path = tempfile.mkstemp(prefix="jci_ca_", suffix=".pem")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("\n".join(blocks) + "\n")
+    _combined_bundle_path = path
+    return path
 
 
 @dataclass
@@ -123,32 +179,63 @@ def _filename_from_url(url: str) -> str:
     return os.path.basename(urlparse(url).path) or "download"
 
 
-def fetch_url(url: str, *, timeout: int = 45) -> FetchResult:
-    """Download a URL via requests+certifi. Never raises."""
-    try:
-        resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout,
-                            verify=ca_bundle(), allow_redirects=True)
-    except requests.exceptions.RequestException as exc:
-        cls, msg = _classify(exc)
-        return FetchResult(ok=False, url=url, error=msg, error_class=cls,
+def _http_error(url: str, status: int, reason: str) -> FetchResult:
+    if status == 403:
+        cls, note = "forbidden", "Forbidden — likely bot protection or an egress policy."
+    elif status == 404:
+        cls, note = "not_found", "Not found (404) — the file URL may have changed."
+    elif status in _RETRY_STATUS:
+        cls, note = "http", (f"HTTP {status} — the origin server was temporarily "
+                             "unavailable (e.g. Cloudflare 521/523). This is a "
+                             "server-side transient issue; retry shortly or use "
+                             "the Upload tab.")
+    else:
+        cls, note = "http", f"HTTP {status} {reason}"
+    return FetchResult(ok=False, url=url, status=status, error=note,
+                       error_class=cls, via_proxy=_via_proxy())
+
+
+def fetch_url(url: str, *, timeout: int = 45, retries: int = 3) -> FetchResult:
+    """Download a URL via requests + combined CA bundle, with retry/backoff on
+    transient (5xx / timeout / connection) failures. Never raises.
+    """
+    bundle = combined_ca_bundle()
+    last: FetchResult | None = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout,
+                                verify=bundle, allow_redirects=True)
+        except requests.exceptions.SSLError as exc:
+            cls, msg = _classify(exc)  # cert errors won't fix on retry -> stop
+            return FetchResult(ok=False, url=url, error=msg, error_class=cls,
+                               via_proxy=_via_proxy())
+        except requests.exceptions.RequestException as exc:
+            cls, msg = _classify(exc)
+            last = FetchResult(ok=False, url=url, error=msg, error_class=cls,
+                               via_proxy=_via_proxy())
+            if cls in ("timeout", "network") and attempt < retries - 1:
+                time.sleep(0.6 * (2 ** attempt))
+                continue
+            return last
+        if resp.status_code in _RETRY_STATUS and attempt < retries - 1:
+            last = _http_error(url, resp.status_code, resp.reason)
+            time.sleep(0.6 * (2 ** attempt))
+            continue
+        if resp.status_code >= 400:
+            return _http_error(url, resp.status_code, resp.reason)
+        return FetchResult(ok=True, url=url, filename=_filename_from_url(url),
+                           content=resp.content, status=resp.status_code,
                            via_proxy=_via_proxy())
-    if resp.status_code >= 400:
-        cls = {403: "forbidden", 404: "not_found"}.get(resp.status_code, "http")
-        note = ("Forbidden — likely bot protection or an egress policy."
-                if resp.status_code == 403 else
-                f"HTTP {resp.status_code} {resp.reason}")
-        return FetchResult(ok=False, url=url, status=resp.status_code,
-                           error=note, error_class=cls, via_proxy=_via_proxy())
-    return FetchResult(ok=True, url=url, filename=_filename_from_url(url),
-                       content=resp.content, status=resp.status_code,
-                       via_proxy=_via_proxy())
+    return last or FetchResult(ok=False, url=url, error="exhausted retries",
+                               error_class="http", via_proxy=_via_proxy())
 
 
 def probe_url(url: str, *, timeout: int = 15) -> FetchResult:
     """Reachability check that does NOT download the whole file. Never raises."""
     try:
         resp = requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout,
-                            verify=ca_bundle(), allow_redirects=True, stream=True)
+                            verify=combined_ca_bundle(), allow_redirects=True,
+                            stream=True)
         status = resp.status_code
         try:
             next(resp.iter_content(64), b"")  # touch the stream then close

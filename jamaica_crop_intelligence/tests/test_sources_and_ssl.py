@@ -30,6 +30,25 @@ def test_fetch_never_raises_and_classifies():
     assert res.error
 
 
+def test_combined_ca_bundle_merges_and_caches():
+    import re
+    path = official_fetch.combined_ca_bundle()
+    assert path and __import__("os").path.exists(path)
+    n = len(re.findall(r"BEGIN CERTIFICATE", open(path).read()))
+    assert n > 1  # certifi + system/env anchors merged
+    assert official_fetch.combined_ca_bundle() == path  # cached
+
+
+def test_transient_5xx_message_is_retriable():
+    for status in (502, 521, 523):
+        r = official_fetch._http_error("http://x", status, "down")
+        assert r.ok is False
+        assert "transient" in r.error.lower() or "temporarily" in r.error.lower()
+    # 404 is NOT framed as transient
+    r404 = official_fetch._http_error("http://x", 404, "nf")
+    assert r404.error_class == "not_found"
+
+
 def test_error_class_distinguishes_cert_from_network():
     import requests
     cls_cert, msg_cert = official_fetch._classify(
