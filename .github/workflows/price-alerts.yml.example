@@ -1,0 +1,30 @@
+# Example: daily JAMIS/Ministry price-spike alert notifier.
+#
+# This is a *.example* file so it never runs automatically. To enable:
+#   1. Rename to price-alerts.yml
+#   2. (Optional) add a repo secret ALERT_WEBHOOK_URL (Slack/Teams/Make webhook)
+#   3. Uncomment the `schedule` trigger for a daily 11:00 UTC run.
+#
+# GitHub Actions runners have open outbound internet, so `--fetch` can pull the
+# official price files directly (unlike a restricted sandbox). If a host is
+# unreachable the notifier falls back to whatever data is present and says so.
+
+name: Price alerts
+on:
+  workflow_dispatch: {}       # manual run from the Actions tab
+  # schedule:
+  #   - cron: "0 11 * * *"    # every day at 11:00 UTC (6:00 AM Jamaica)
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Compute and send price alerts
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: python scripts/price_alert_notifier.py --threshold 15 --top 5 --fetch

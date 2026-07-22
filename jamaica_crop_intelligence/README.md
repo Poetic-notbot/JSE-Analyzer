@@ -46,9 +46,10 @@ Non-negotiables enforced in code and copy:
 6. **Threats** — climate / pest / disease / security seasonality heatmap (incl. praedial larceny).
 7. **Procurement Planner** — demand → required quantity (buffer + post-harvest loss) → local supplier coverage, with supply-shock what-ifs.
 8. **Procurement Integration** — RFQ → quotation (scored comparison) → contract award → delivery recording → fulfillment KPIs, supplier performance, planned-vs-actual, shortages & rejections.
-9. **Reports** — multi-sheet Excel export.
-10. **Data & Methodology** — sources, provenance, modelled relationships, honest limitations.
-11. **Administration** — official-file ingestion: upload → parse → crop/unit review → data-quality flags → approve/reject → idempotent commit into normalized fact tables.
+9. **Forecast & Alerts** — modelled seasonal+trend price forecast with a ~90% band and backtest MAPE; price-spike detection, top-5 volatility watchlist, and recorded alerts.
+10. **Reports** — multi-sheet Excel export.
+11. **Data & Methodology** — sources, provenance, modelled relationships, honest limitations.
+12. **Administration** — official-file **auto-fetch** + upload → parse → crop/unit review → data-quality flags → approve/reject → idempotent commit; plus a connectivity-diagnostics panel.
 
 ## Architecture
 
@@ -110,6 +111,34 @@ a warm-restarted deployment is never left on a stale schema.
 > policy (the build sandbox blocks moa.gov.jm / data.gov.jm). Auto-fetch reports
 > this honestly; the same files can be downloaded and uploaded instead. See
 > [`output/source_register.md`](../output/source_register.md).
+
+## Forecasting & alerts
+
+- **Forecast** (`calculations/forecast.py`, `services/forecast_service.py`): an
+  OLS linear trend + additive seasonal factors with an empirical ~90% band, and
+  a backtest MAPE. Dependency-light (numpy/pandas — no statsmodels/Prophet) so it
+  deploys cleanly. Always labelled a **modelled estimate**; runs on seed prices
+  now and ingested official prices later.
+- **Alerts** (`services/alert_service.py`): period-on-period price-spike
+  detection at a configurable threshold, a top-N volatility watchlist, and alerts
+  recorded into the `alerts` table (deduped by title).
+
+### Daily notifications (external notifier)
+
+The app *detects and records* alerts; it never claims to send a notification it
+cannot. To deliver a daily digest, run the standalone notifier on a schedule:
+
+```bash
+# prints JSON; POSTs to $ALERT_WEBHOOK_URL if set (Slack/Teams/Make webhook)
+python scripts/price_alert_notifier.py --threshold 15 --top 5 --fetch
+```
+
+A ready-to-enable GitHub Action is provided at
+`.github/workflows/price-alerts.yml.example` (rename to `.yml`, add an
+`ALERT_WEBHOOK_URL` secret, uncomment the daily `schedule`). GitHub runners have
+open internet, so `--fetch` can pull official prices there even though a
+restricted sandbox cannot. Email delivery requires an email provider/credential
+configured by the operator (not bundled).
 
 ## Modelled relationships
 

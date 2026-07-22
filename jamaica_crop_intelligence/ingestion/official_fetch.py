@@ -103,6 +103,51 @@ def fetch_url(url: str, *, timeout: int = 45) -> FetchResult:
         return FetchResult(ok=False, url=url, via_proxy=via_proxy, error=str(exc))
 
 
+def probe_url(url: str, *, timeout: int = 15) -> FetchResult:
+    """Lightweight reachability check: open the connection, read a few bytes,
+    do NOT download the whole file. Never raises.
+    """
+    proxies = urllib.request.getproxies()
+    handlers: list = []
+    via_proxy = False
+    if proxies:
+        handlers.append(urllib.request.ProxyHandler(proxies))
+        via_proxy = True
+    handlers.append(urllib.request.HTTPSHandler(context=_ssl_context()))
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "JamaicaCropIntelligence/1.0 (+probe)"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            resp.read(64)  # touch the stream; enough to confirm reachability
+            return FetchResult(ok=True, url=url, status=getattr(resp, "status", 200),
+                               via_proxy=via_proxy)
+    except urllib.error.HTTPError as exc:
+        # An HTTP status (even 404) means the host WAS reachable.
+        return FetchResult(ok=True, url=url, status=exc.code, via_proxy=via_proxy,
+                           error=f"HTTP {exc.code} {exc.reason}")
+    except urllib.error.URLError as exc:
+        msg = str(getattr(exc, "reason", exc))
+        blocked = "403" in msg or "tunnel" in msg.lower() or "forbidden" in msg.lower()
+        return FetchResult(ok=False, url=url, via_proxy=via_proxy,
+                           error=("blocked by network/egress policy" if blocked else msg))
+    except Exception as exc:  # noqa: BLE001
+        return FetchResult(ok=False, url=url, via_proxy=via_proxy, error=str(exc))
+
+
+def check_all_sources(*, timeout: int = 15) -> list[dict]:
+    """Probe every fetchable official source; return a reachability report."""
+    report = []
+    for s in fetchable_sources():
+        res = probe_url(s["url"], timeout=timeout)
+        report.append({
+            "source": s["name"], "kind": s["kind"], "url": s["url"],
+            "reachable": res.ok, "status": res.status,
+            "note": res.error or ("ok" if res.ok else ""),
+        })
+    return report
+
+
 def fetch_and_preview(import_service, source: dict, *, timeout: int = 45) -> dict:
     """Fetch an official source and run it through preview (no commit).
 

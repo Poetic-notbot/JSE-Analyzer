@@ -22,6 +22,8 @@ from jamaica_crop_intelligence.components import ui
 from jamaica_crop_intelligence.config import settings
 from jamaica_crop_intelligence.exports import excel_export
 from jamaica_crop_intelligence.ingestion import official_fetch
+from jamaica_crop_intelligence.services.alert_service import AlertService
+from jamaica_crop_intelligence.services.forecast_service import ForecastService
 from jamaica_crop_intelligence.services.import_service import ImportService
 from jamaica_crop_intelligence.services.price_service import PriceService
 from jamaica_crop_intelligence.services.procurement_integration_service import (
@@ -53,6 +55,8 @@ class Context:
         self.integration = ProcurementIntegrationService(repo)
         self.scenario = ScenarioService(repo)
         self.imports = ImportService(repo)
+        self.forecast = ForecastService(repo)
+        self.alerts = AlertService(repo)
 
 
 @st.cache_resource(show_spinner="Initialising crop database...")
@@ -533,6 +537,90 @@ def page_procurement_integration(ctx: Context) -> None:
             st.dataframe(sr, use_container_width=True, hide_index=True, height=260)
 
 
+def page_forecast_alerts(ctx: Context) -> None:
+    ui.section("Forecast & Alerts",
+               "Modelled price projections and price-spike monitoring")
+    st.warning("Forecasts are **modelled estimates**, not observed data. They "
+               "run on whatever price history is present (illustrative seeds now, "
+               "official data once ingested).", icon="⚖️")
+
+    tabs = st.tabs(["Price forecast", "Spike alerts & watchlist"])
+
+    # ------------------------------------------------------------- forecast
+    with tabs[0]:
+        crop_id, crop_name = crop_selector(ctx, "fc_crop")
+        c1, c2 = st.columns(2)
+        horizon = c1.slider("Periods ahead", 1, 8, 4)
+        ptypes = ctx.prices.distinct_price_types(crop_id) or ["farmgate"]
+        ptype = c2.selectbox("Price type", ptypes, key="fc_ptype")
+        out = ctx.forecast.forecast_price(crop_id, horizon=horizon, price_type=ptype)
+        hist, fdf = out["history"], out["forecast"]
+        if hist.empty:
+            st.caption("No price history for this crop/price type.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(hist["period_label"]), y=list(hist["price"]),
+                mode="lines+markers", name="history", line=dict(color="#1b7837")))
+            if not fdf.empty:
+                fx = [f"+{s}" for s in fdf["step"]]
+                # confidence band
+                fig.add_trace(go.Scatter(
+                    x=fx + fx[::-1],
+                    y=list(fdf["upper"]) + list(fdf["lower"])[::-1],
+                    fill="toself", fillcolor="rgba(33,102,172,0.15)",
+                    line=dict(color="rgba(0,0,0,0)"), name="~90% band",
+                    hoverinfo="skip"))
+                fig.add_trace(go.Scatter(
+                    x=fx, y=list(fdf["point"]), mode="lines+markers",
+                    name="forecast", line=dict(color="#2166ac", dash="dash")))
+            fig.update_layout(height=380, yaxis_title="JMD/kg", xaxis_title="",
+                              margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+            mape = out.get("mape")
+            ui.kpi_row([
+                ("Method", "Seasonal + trend", None),
+                ("Backtest MAPE", f"{mape:.1f}%" if mape is not None else "n/a", None),
+                ("Horizon", f"{horizon} periods", None),
+            ])
+            st.markdown(ui.provenance_badge("modelled"), unsafe_allow_html=True)
+            if not fdf.empty:
+                st.dataframe(fdf.rename(columns={"point": "forecast_jmd_per_kg"}),
+                             use_container_width=True, hide_index=True)
+
+    # --------------------------------------------------------------- alerts
+    with tabs[1]:
+        threshold = st.slider("Spike threshold (period-on-period % change)",
+                              5, 60, 15, key="spike_thr")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Top-5 most volatile crops**")
+            st.dataframe(ctx.alerts.top_volatile(5), use_container_width=True,
+                         hide_index=True)
+        with c2:
+            st.markdown(f"**Detected spikes (|Δ| ≥ {threshold}%)**")
+            spikes = ctx.alerts.price_spikes(threshold)
+            if spikes.empty:
+                st.caption("No spikes at this threshold.")
+            else:
+                st.dataframe(spikes[["crop", "change_pct", "direction", "period"]],
+                             use_container_width=True, hide_index=True, height=240)
+
+        if st.button("Generate alerts from current spikes"):
+            n = ctx.alerts.generate_alerts(threshold)
+            st.success(f"Recorded {n} new alert(s).")
+
+        st.markdown("**Recent alerts**")
+        st.dataframe(ctx.alerts.recent_alerts(20), use_container_width=True,
+                     hide_index=True, height=240)
+
+        st.info("**Delivery**: this engine detects and records alerts. To send "
+                "daily push/email notifications, wire an external notifier (e.g. a "
+                "scheduled GitHub Action calling `AlertService.watchlist`) — see the "
+                "README. The app does not claim to send notifications it cannot.",
+                icon="📣")
+
+
 def page_reports(ctx: Context) -> None:
     ui.section("Reports", "Export an Excel workbook of the current data")
     st.write("Choose the sheets to include, then download.")
@@ -600,7 +688,11 @@ def page_methodology(ctx: Context) -> None:
         "adjacent months, small baseline elsewhere.\n"
         "- **Price response**: %ΔPrice = %ΔQuantity / elasticity (default -0.6).\n"
         "- **Threat exposure**: impact x seasonal intensity x in-season availability.\n"
-        "- **Required procurement**: demand x (1+buffer) / (1-loss)."
+        "- **Required procurement**: demand x (1+buffer) / (1-loss).\n"
+        "- **Price forecast**: OLS trend + additive seasonal factors, ~90% band "
+        "from residual spread (a modelled estimate, never observed).\n"
+        "- **Spike alerts**: period-on-period % change over a threshold; "
+        "volatility = coefficient of variation of price."
     )
     st.caption(f"App version {__version__}. Legacy JSE stock analyzer remains at app.py.")
 
@@ -671,6 +763,19 @@ def page_admin(ctx: Context) -> None:
 
     # ---------------------------------------------------------------- fetch
     with fetch_tab:
+        with st.expander("🔌 Test connectivity to official sources", expanded=False):
+            st.caption("Probes each source host from wherever this app is running. "
+                       "Streamlit Community Cloud usually has open outbound internet; "
+                       "restricted sandboxes may block these hosts.")
+            if st.button("Run connectivity test"):
+                with st.spinner("Probing sources…"):
+                    report = official_fetch.check_all_sources(timeout=12)
+                rdf = pd.DataFrame(report)
+                rdf["reachable"] = rdf["reachable"].map({True: "✅ reachable",
+                                                         False: "⛔ blocked"})
+                st.dataframe(rdf[["source", "kind", "reachable", "status", "note"]],
+                             use_container_width=True, hide_index=True)
+
         sources = official_fetch.fetchable_sources()
         labels = {f"{s['name']}  ·  {s['kind']}": s for s in sources}
         pick = st.selectbox("Official source", list(labels), key="fetch_src")
@@ -727,6 +832,7 @@ PAGES = {
     "Threats": page_threats,
     "Procurement Planner": page_procurement_planner,
     "Procurement Integration": page_procurement_integration,
+    "Forecast & Alerts": page_forecast_alerts,
     "Reports": page_reports,
     "Data & Methodology": page_methodology,
     "Administration": page_admin,
