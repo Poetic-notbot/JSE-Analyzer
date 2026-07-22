@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# App runtime data (SQLite is rebuilt + reseeded on startup)
+jamaica_crop_intelligence/data/*.db
+jamaica_crop_intelligence/data/*.db-journal
+
+# Scratch
+scratch_*.py
+/tmp_*
