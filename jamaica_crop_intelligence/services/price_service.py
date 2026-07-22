@@ -12,15 +12,21 @@ class PriceService:
     def __init__(self, repo: Repository):
         self.repo = repo
 
+    # Suppress illustrative seeds for any crop that has official prices, so real
+    # ingested data supersedes placeholders instead of mixing with them.
+    _SUPERSEDE = (" AND NOT (p.provenance='illustrative' AND EXISTS ("
+                  "  SELECT 1 FROM price_records o WHERE o.crop_id=p.crop_id "
+                  "  AND o.provenance LIKE 'official%'))")
+
     def prices(self, crop_id: int | None = None) -> pd.DataFrame:
         sql = ("SELECT c.canonical_name AS crop, p.year, p.quarter, "
                "p.price_jmd, p.price_per_kg_jmd, p.price_type, p.provenance, "
                "m.name AS market FROM price_records p "
                "JOIN crops c ON c.id=p.crop_id "
-               "LEFT JOIN markets m ON m.id=p.market_id")
+               "LEFT JOIN markets m ON m.id=p.market_id WHERE 1=1" + self._SUPERSEDE)
         params: list = []
         if crop_id is not None:
-            sql += " WHERE p.crop_id=?"
+            sql += " AND p.crop_id=?"
             params.append(crop_id)
         sql += " ORDER BY p.year, p.quarter"
         return self.repo.df(sql, params)
@@ -45,8 +51,8 @@ class PriceService:
             "JOIN crops c ON c.id=p.crop_id "
             "WHERE (p.year, p.quarter) = "
             "  (SELECT year, quarter FROM price_records "
-            "   ORDER BY year DESC, quarter DESC LIMIT 1) "
-            "ORDER BY p.price_per_kg_jmd DESC")
+            "   ORDER BY year DESC, quarter DESC LIMIT 1)" + self._SUPERSEDE +
+            " ORDER BY p.price_per_kg_jmd DESC")
 
     # -- filters / dynamic dimensions ---------------------------------------
     def distinct_price_types(self, crop_id: int | None = None) -> list[str]:
@@ -73,7 +79,7 @@ class PriceService:
         """
         sql = ("SELECT year, quarter, month, price_date, week_ending, "
                "price_type, market_location, price_per_kg_jmd, price_jmd, "
-               "provenance FROM price_records WHERE crop_id=?")
+               "provenance FROM price_records p WHERE p.crop_id=?" + self._SUPERSEDE)
         params: list = [crop_id]
         if price_type:
             sql += " AND price_type=?"

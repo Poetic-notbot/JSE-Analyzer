@@ -21,7 +21,7 @@ from jamaica_crop_intelligence import __version__
 from jamaica_crop_intelligence.components import ui
 from jamaica_crop_intelligence.config import settings
 from jamaica_crop_intelligence.exports import excel_export
-from jamaica_crop_intelligence.ingestion import official_fetch
+from jamaica_crop_intelligence.ingestion import faostat, official_fetch
 from jamaica_crop_intelligence.services.alert_service import AlertService
 from jamaica_crop_intelligence.services.forecast_service import ForecastService
 from jamaica_crop_intelligence.services.import_service import ImportService
@@ -159,7 +159,10 @@ def page_calendar(ctx: Context) -> None:
         st.markdown("**Observed quarterly production** (tonnes)")
         if not prod.empty:
             prod = prod.copy()
-            prod["period"] = prod["year"].astype(str) + "-Q" + prod["quarter"].astype(str)
+            prod["period"] = prod.apply(
+                lambda r: (f"{int(r['year'])}-Q{int(r['quarter'])}"
+                           if pd.notna(r["quarter"]) else f"{int(r['year'])} (annual)"),
+                axis=1)
             fig = px.bar(prod, x="period", y="tonnes", color="tonnes",
                          color_continuous_scale="Greens")
             fig.update_layout(height=340, coloraxis_showscale=False,
@@ -698,9 +701,12 @@ def page_methodology(ctx: Context) -> None:
 
 
 def _render_ingestion_preview(ctx: Context, content: bytes, filename: str,
-                              kind: str, sfid: int, key_prefix: str) -> None:
-    """Shared preview + approve/reject UI for both upload and fetch paths."""
-    preview = ctx.imports.preview(content, filename, kind)
+                              kind: str, sfid: int, key_prefix: str,
+                              preview: dict | None = None) -> None:
+    """Shared preview + approve/reject UI. ``preview`` may be pre-built (e.g.
+    FAOSTAT); otherwise it is parsed from the file content."""
+    if preview is None:
+        preview = ctx.imports.preview(content, filename, kind)
     summary = preview["summary"]
 
     cols = st.columns(5)
@@ -776,9 +782,35 @@ def page_admin(ctx: Context) -> None:
                 st.dataframe(rdf[["source", "kind", "reachable", "status", "note"]],
                              use_container_width=True, hide_index=True)
 
+        # FAOSTAT — cleanest source: open REST API, annual Jamaica series.
+        with st.expander("🌎 FAOSTAT — Jamaica annual production/area (open API)",
+                         expanded=False):
+            fc1, fc2 = st.columns(2)
+            element = fc1.selectbox("Series", ["production", "area"], key="fao_el")
+            yr_to = pd.Timestamp.today().year
+            years = fc2.multiselect("Years", list(range(yr_to, 2009, -1)),
+                                    default=[yr_to - 2, yr_to - 3, yr_to - 4],
+                                    key="fao_yrs")
+            if st.button("Fetch FAOSTAT", key="fao_fetch"):
+                with st.spinner("Fetching FAOSTAT…"):
+                    st.session_state["fao_out"] = faostat.fetch_and_preview(
+                        ctx.imports, element, sorted(years) or None)
+            fout = st.session_state.get("fao_out")
+            if fout is not None:
+                if not fout["ok"]:
+                    fr = fout["fetch"]
+                    st.error(f"FAOSTAT fetch failed [{fr.error_class or 'error'}]: {fr.error}")
+                else:
+                    st.success(f"Fetched FAOSTAT ({fout['fetch'].size:,} bytes).")
+                    _render_ingestion_preview(ctx, fout["fetch"].content,
+                                              fout["preview"]["filename"],
+                                              fout["kind"], fout["source_file_id"],
+                                              "fao", preview=fout["preview"])
+
         sources = official_fetch.fetchable_sources()
         labels = {f"{s['name']}  ·  {s['kind']}": s for s in sources}
-        pick = st.selectbox("Official source", list(labels), key="fetch_src")
+        pick = st.selectbox("Official source (direct file download)", list(labels),
+                            key="fetch_src")
         chosen = labels[pick]
         st.caption(f"URL: {chosen['url']}")
         if st.button("⤵️ Fetch now", key="do_fetch"):
@@ -789,10 +821,20 @@ def page_admin(ctx: Context) -> None:
         if out is not None:
             res = out["fetch"]
             if not out["ok"]:
-                st.error(f"Fetch failed: {res.error}")
-                st.caption("This is expected where the host is blocked by the "
-                           "network/egress policy. Deploy where the network allows, "
-                           "or use the Upload tab with a downloaded copy.")
+                st.error(f"Fetch failed [{res.error_class or 'error'}]: {res.error}")
+                if res.error_class == "cert_trust":
+                    st.caption("Certificate-trust failure — the server was reached "
+                               "but its chain isn't trusted. Not a network block. "
+                               "If it persists, the host serves an incomplete chain; "
+                               "download in a browser and use the Upload tab.")
+                elif res.error_class in ("proxy_block", "forbidden"):
+                    st.caption("Host blocked by an egress policy or bot protection. "
+                               "Deploy where the host is allowed, or use the Upload tab.")
+                elif res.error_class in ("timeout", "network"):
+                    st.caption("Genuine network/reachability problem (timeout or "
+                               "refused). Retry, or use the Upload tab.")
+                else:
+                    st.caption("Use the Upload tab with a downloaded copy if this persists.")
             else:
                 st.success(f"Fetched {res.filename} ({res.size:,} bytes) "
                            + ("— new file." if out["is_new"] else "— already registered."))

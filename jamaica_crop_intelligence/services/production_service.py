@@ -54,10 +54,18 @@ class ProductionService:
 
     # -- observed quarterly production --------------------------------------
     def production(self, crop_id: int) -> pd.DataFrame:
-        """Observed/illustrative quarterly production for a crop."""
+        """Observed/illustrative quarterly production for a crop.
+
+        Once official rows exist for a crop, illustrative seeds for that crop are
+        suppressed so real data supersedes placeholders (no double counting).
+        """
         return self.repo.df(
-            "SELECT year, quarter, tonnes, provenance FROM production_records "
-            "WHERE crop_id=? AND parish IS NULL ORDER BY year, quarter",
+            "SELECT year, quarter, tonnes, provenance FROM production_records p "
+            "WHERE crop_id=? AND parish IS NULL "
+            "AND NOT (provenance='illustrative' AND EXISTS ("
+            "  SELECT 1 FROM production_records o WHERE o.crop_id=p.crop_id "
+            "  AND o.provenance LIKE 'official%')) "
+            "ORDER BY year, quarter",
             (crop_id,))
 
     def latest_year(self) -> int | None:
@@ -65,8 +73,11 @@ class ProductionService:
 
     def total_production(self, year: int | None = None) -> pd.DataFrame:
         sql = ("SELECT c.canonical_name AS crop, SUM(p.tonnes) AS tonnes, "
-               "p.provenance FROM production_records p "
-               "JOIN crops c ON c.id=p.crop_id WHERE p.parish IS NULL")
+               "MIN(p.provenance) AS provenance FROM production_records p "
+               "JOIN crops c ON c.id=p.crop_id WHERE p.parish IS NULL "
+               "AND NOT (p.provenance='illustrative' AND EXISTS ("
+               "  SELECT 1 FROM production_records o WHERE o.crop_id=p.crop_id "
+               "  AND o.provenance LIKE 'official%'))")
         params: list = []
         if year is not None:
             sql += " AND p.year=?"

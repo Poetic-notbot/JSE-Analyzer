@@ -77,12 +77,28 @@ ephemeral, so the DB is created and **re-seeded on each cold start**; set
 On the **Administration** page, two paths feed the same pipeline:
 
 **Auto-fetch** (`ingestion/official_fetch.py`) — pick an official source and
-**Fetch now**. The adapter downloads the file over HTTPS, honouring an
-environment proxy + CA bundle where present, and **fails gracefully** with a
-clear reason if a host is blocked (never fabricating data). It works directly
-where the network allows (e.g. Streamlit Community Cloud).
+**Fetch now**. Uses `requests` + a browser User-Agent, with TLS verification
+routed through an explicit CA bundle (`REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` or
+**certifi**) — never disabled. Failures are **classified honestly**
+(`cert_trust` vs `timeout` vs `proxy_block`/`forbidden` vs `network`) so a
+certificate-trust problem is never mislabelled as a network block.
 
-**Upload** — drop a CSV / Excel / PDF for the chosen kind.
+**FAOSTAT** (`ingestion/faostat.py`) — the cleanest source: the open FAOSTAT
+REST API for Jamaica (area 109, QCL), annual production (t) and area harvested
+(ha). Item names are mapped to the crop taxonomy; committed as annual
+(quarter = NULL) `official_observed` rows.
+
+**MoA weekly XLSX** (`ingestion/moa_weekly.py`) — report-type-aware parser for
+the Ministry's weekly price workbooks, which are **not** a uniform schema:
+Farmgate/Rural-Retail use a parish layout with **merged header cells** (Low/High/
+Most-Frequent/Supply/Grade per parish); Retail/Wholesale use the Kingston
+supermarket layout (Average Price). Routed automatically for `.xlsx` price files.
+
+**Upload** — drop a CSV / Excel / PDF for the chosen kind (permanent fallback).
+
+**Official supersedes illustrative**: once official rows exist for a crop, its
+illustrative seed rows are suppressed in production/price queries, so real data
+replaces placeholders instead of double-counting.
 
 Both then run:
 

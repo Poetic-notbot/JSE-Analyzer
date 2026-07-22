@@ -25,7 +25,7 @@ from typing import Any
 import pandas as pd
 
 from ..calculations import core
-from . import validation
+from . import moa_weekly, validation
 
 
 def _infer_price_type(header: str | None) -> str:
@@ -300,8 +300,73 @@ def _parse_quarter(val: Any) -> int | None:
 # --------------------------------------------------------------------------- #
 # Main parse -> normalized preview
 # --------------------------------------------------------------------------- #
+def _build_moa_price_preview(moa_df: pd.DataFrame, filename: str, repo) -> dict:
+    """Normalize a MoA weekly tidy price frame into a preview payload."""
+    alias_map = build_alias_map(repo)
+    canonical = [r["canonical_name"] for r in
+                 repo.query("SELECT canonical_name FROM crops")]
+    result: dict[str, Any] = {
+        "kind": "prices", "filename": filename,
+        "raw_preview": moa_df.head(15), "normalized": pd.DataFrame(),
+        "quality_issues": [], "crop_review": [], "unit_review": [],
+        "columns_detected": {"source": "MoA weekly workbook",
+                             "report_type": moa_df["price_type"].iloc[0]
+                             if not moa_df.empty else None},
+        "price_type_columns": {}, "summary": {},
+    }
+    rows: list[dict] = []
+    unmatched: dict[str, str | None] = {}
+    for _, r in moa_df.iterrows():
+        raw_crop = r["commodity"]
+        cid, suggestion = normalize_crop(raw_crop, alias_map, canonical)
+        if cid is None:
+            unmatched[str(raw_crop)] = suggestion
+            continue
+        iso = r.get("week_ending")
+        rows.append({
+            "crop_id": cid, "crop_raw": str(raw_crop),
+            "original_crop_name": str(raw_crop),
+            "year": _year_from_date(iso), "quarter": _quarter_from_date(iso),
+            "parish": None, "price_date": iso, "week_ending": iso,
+            "market_location": r.get("location"),
+            "price_jmd": float(r["price_jmd"]),
+            "price_per_kg_jmd": float(r["price_jmd"]),  # files are already J$/kg
+            "price_type": r.get("price_type", "farmgate"), "confidence": 1.0,
+        })
+    normalized = pd.DataFrame(rows)
+    normalized, vflags = validation.validate_price_rows(normalized)
+    result["normalized"] = normalized
+    result["quality_issues"].extend(vflags)
+    result["crop_review"] = [{"raw": k, "suggestion": v}
+                             for k, v in sorted(unmatched.items())]
+    for item in result["crop_review"]:
+        result["quality_issues"].append(
+            {"severity": "warning", "category": "crop_name",
+             "detail": f"Unmatched crop '{item['raw']}'"
+                       + (f" (suggest: {item['suggestion']})" if item["suggestion"] else ""),
+             "raw_value": item["raw"]})
+    result["summary"] = {
+        "rows_in_file": int(len(moa_df)),
+        "rows_normalized": int(len(normalized)),
+        "unmatched_crops": len(result["crop_review"]),
+        "unknown_units": 0,
+        "quality_issues": len(result["quality_issues"]),
+    }
+    return result
+
+
 def parse_file(content: bytes, filename: str, kind: str, repo) -> dict:
     """Parse and normalize a file into a preview payload (nothing committed)."""
+    # Special case: MoA weekly price workbooks have bespoke multi-row/merged-cell
+    # layouts that the generic tabular reader cannot handle. Try them first.
+    if kind == "prices" and filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        try:
+            moa_df = moa_weekly.parse_workbook(content, filename)
+        except Exception:  # noqa: BLE001 - fall back to generic on any failure
+            moa_df = pd.DataFrame()
+        if moa_df is not None and not moa_df.empty:
+            return _build_moa_price_preview(moa_df, filename, repo)
+
     df, issues = load_tabular(content, filename)
     result: dict[str, Any] = {
         "kind": kind, "filename": filename,

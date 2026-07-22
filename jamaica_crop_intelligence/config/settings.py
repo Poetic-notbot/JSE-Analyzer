@@ -131,6 +131,34 @@ OFFICIAL_SOURCES = [
         "provenance": "official_registry",
     },
     {
+        "name": "MoA Commodity Prices — weekly workbooks (XLSX)",
+        # Weekly-dated files, pattern:
+        # .../sites/default/files/pdfs/<Type>%20<MM.DD.YYYY>.xlsx
+        # Types: Farmgate, Wholesale, Retail, Rural Retail, Urban Municipal, Meat.
+        # Download the current week and use the Upload tab (dated URLs rotate).
+        "url": "https://www.moa.gov.jm/document-categories/commodity-prices",
+        "kind": "portal",
+        "provenance": "official_observed",
+    },
+    {
+        "name": "FAOSTAT — Jamaica crops & livestock (open API/CSV)",
+        "url": "https://fenixservices.fao.org/faostat/api/v1/en/data/QCL?area=109&element=5510&output_type=objects",
+        "kind": "api",
+        "provenance": "official_observed",
+    },
+    {
+        "name": "JAMIS — Jamaica Agricultural Marketing Info System (live prices)",
+        "url": "https://www.ja-mis.com",
+        "kind": "portal",
+        "provenance": "official_observed",
+    },
+    {
+        "name": "STATIN — Statistical Institute of Jamaica",
+        "url": "https://statinja.gov.jm",
+        "kind": "portal",
+        "provenance": "official_observed",
+    },
+    {
         "name": "FAO-RADA crop-calendar initiative (context)",
         "url": "https://www.fao.org/jamaica-bahamas-and-belize/news/detail-events/zh/c/1709422/",
         "kind": "guidance",
