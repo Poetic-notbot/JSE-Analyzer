@@ -721,6 +721,10 @@ def _render_ingestion_preview(ctx: Context, content: bytes, filename: str,
     if preview.get("price_type_columns"):
         st.caption("Price-type columns detected: "
                    + ", ".join(preview["price_type_columns"]))
+    if "production_rows" in summary or "area_rows" in summary:
+        st.caption(f"FAOSTAT split → production: {summary.get('production_rows', 0)} rows, "
+                   f"area harvested: {summary.get('area_rows', 0)} rows "
+                   "(committed to their respective tables as annual, official).")
 
     if preview["crop_review"]:
         st.markdown("**Crop-name review** (unmatched → suggestion)")

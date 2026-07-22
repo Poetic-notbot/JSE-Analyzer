@@ -100,6 +100,57 @@ def test_faostat_maps_taxonomy_and_validates(repo):
     assert row["quarter"] is None
 
 
+# ----------------------------------------------------------- FAOSTAT bulk CSV
+FAOSTAT_CSV = (
+    "Domain,Area,Element Code,Element,Item Code (CPC),Item,Year,Unit,Value,Flag\n"
+    "QCL,Jamaica,5510,Production,1520,Yams,2023,t,194959,A\n"
+    "QCL,Jamaica,5510,Production,1520,Yams,2024,t,191667,A\n"
+    "QCL,Jamaica,5312,Area harvested,1520,Yams,2024,ha,12000,A\n"
+    "QCL,Jamaica,5510,Production,1290,Tomatoes,2024,t,20000,A\n"
+    "QCL,Jamaica,5419,Yield,1520,Yams,2024,kg/ha,16000,E\n"     # yield -> ignored
+    "QCL,Jamaica,5510,Production,9999,Avocados,2024,t,3000,A\n"  # not in taxonomy
+)
+
+
+def test_faostat_bulk_csv_detected_and_routed(repo):
+    imp = ImportService(repo)
+    # deliberately pass the wrong kind ('prices') — detection overrides it
+    prev = imp.preview(FAOSTAT_CSV.encode(), "FAOSTAT_data.csv", "prices")
+    assert prev["columns_detected"]["source"] == "FAOSTAT bulk CSV"
+    assert prev["summary"]["production_rows"] == 3   # 2 yam + 1 tomato
+    assert prev["summary"]["area_rows"] == 1
+    # yield ignored; avocado unmatched
+    assert any("Avocados" in c["raw"] for c in prev["crop_review"])
+
+    sfid, _ = imp.register_source_file("FAOSTAT_data.csv", FAOSTAT_CSV.encode(),
+                                       "production", source_name="FAOSTAT bulk CSV")
+    res = imp.commit_preview(sfid, "production", prev["normalized"],
+                             prev["quality_issues"])
+    assert res["rows_committed"] == 4  # 3 production + 1 area, both tables
+    assert repo.scalar("SELECT COUNT(*) FROM production_records "
+                       "WHERE provenance='official_observed'") == 3
+    assert repo.scalar("SELECT COUNT(*) FROM area_reaped_records "
+                       "WHERE provenance='official_observed'") == 1
+    # real annual yam data landed with quarter NULL (official row)
+    yam = repo.query_one("SELECT p.year, p.tonnes, p.quarter FROM production_records p "
+                         "JOIN crops c ON c.id=p.crop_id "
+                         "WHERE c.canonical_name='Yellow Yam' AND p.year=2024 "
+                         "AND p.provenance='official_observed'")
+    assert yam["tonnes"] == 191667
+    assert yam["quarter"] is None
+    # and the service layer shows ONLY the official series (seeds superseded)
+    from jamaica_crop_intelligence.services.production_service import ProductionService
+    yam_series = ProductionService(repo).production(repo.crop_id_by_name("Yellow Yam"))
+    assert set(yam_series["provenance"]) == {"official_observed"}
+
+
+def test_faostat_is_csv_detection():
+    assert faostat.is_faostat_csv(
+        pd.read_csv(io.StringIO(FAOSTAT_CSV))) is True
+    assert faostat.is_faostat_csv(
+        pd.DataFrame({"crop": [1], "price": [2]})) is False
+
+
 # ------------------------------------------------------------- MoA weekly xlsx
 def _farmgate_workbook() -> bytes:
     import openpyxl

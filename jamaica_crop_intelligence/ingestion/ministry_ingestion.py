@@ -384,6 +384,13 @@ def parse_file(content: bytes, filename: str, kind: str, repo) -> dict:
              "detail": "No tabular rows to normalize."})
         return result
 
+    # FAOSTAT bulk CSV has a bespoke Element/Item/Value shape that the generic
+    # column detector mis-reads. Detect and route it regardless of the selected
+    # kind (it carries its own Production/Area rows).
+    from . import faostat  # local import avoids a circular import at load time
+    if faostat.is_faostat_csv(df):
+        return faostat.build_preview_from_df(df, repo)
+
     cols = detect_columns(df)
     result["columns_detected"] = cols
     alias_map = build_alias_map(repo)
@@ -587,9 +594,12 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
     committed = 0
     for _, r in normalized.iterrows():
         row = r.to_dict()
-        key = _record_key(kind, row)
-        before = repo.table_count(_TABLE_FOR_KIND[kind])
-        if kind == "prices":
+        # A row may carry its own target_kind (e.g. a FAOSTAT bulk CSV mixing
+        # production + area harvested). Otherwise use the call-level kind.
+        eff_kind = row.get("target_kind") or kind
+        key = _record_key(eff_kind, row)
+        before = repo.table_count(_TABLE_FOR_KIND[eff_kind])
+        if eff_kind == "prices":
             repo.insert("price_records", {
                 "crop_id": row["crop_id"], "parish": row.get("parish"),
                 "year": row.get("year"), "quarter": row.get("quarter"),
@@ -605,7 +615,7 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
                 "provenance": "official_observed",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
-        elif kind == "production":
+        elif eff_kind == "production":
             repo.insert("production_records", {
                 "crop_id": row["crop_id"], "parish": row.get("parish"),
                 "year": row.get("year"), "quarter": row.get("quarter"),
@@ -615,7 +625,7 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
                 "provenance": "official_observed",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
-        elif kind == "area_reaped":
+        elif eff_kind == "area_reaped":
             repo.insert("area_reaped_records", {
                 "crop_id": row["crop_id"], "parish": row.get("parish"),
                 "year": row.get("year"), "quarter": row.get("quarter"),
@@ -625,7 +635,7 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
                 "provenance": "official_observed",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
-        elif kind == "registry":
+        elif eff_kind == "registry":
             repo.insert("parish_crop_registry", {
                 "crop_id": row["crop_id"], "parish": row.get("parish"),
                 "farmer_count": row.get("farmer_count"),
@@ -633,7 +643,7 @@ def commit_rows(normalized: pd.DataFrame, kind: str, source_file_id: int,
                 "provenance": "official_registry",
                 "source_file_id": source_file_id, "record_key": key,
             }, or_ignore=True)
-        after = repo.table_count(_TABLE_FOR_KIND[kind])
+        after = repo.table_count(_TABLE_FOR_KIND[eff_kind])
         if after > before:
             committed += 1
     return committed
