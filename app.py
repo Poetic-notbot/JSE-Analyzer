@@ -125,8 +125,14 @@ def _apply_fx(ticker, df, aggregates, currency):
 
 
 
-def _fetch(url, retries=4, delay=1.4):
-    """Download a URL's text, retrying politely on transient failures."""
+def _fetch(url, retries=5, delay=1.4):
+    """Download a URL's text, retrying politely on transient failures.
+
+    A 404 is a definitive 'not covered' and returns immediately. Throttling
+    (429) and forbidden (403) responses - which the site returns under rapid
+    sequential requests, and which caused single statements to intermittently
+    fail to load - get a longer, escalating backoff so they usually recover
+    within the retry budget."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
@@ -135,7 +141,10 @@ def _fetch(url, retries=4, delay=1.4):
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
-            time.sleep(delay * (attempt + 1))
+            wait = delay * (attempt + 1)
+            if exc.code in (403, 429):                # throttled: back off harder
+                wait = delay * (attempt + 1) * 2.0
+            time.sleep(wait)
         except Exception:
             time.sleep(delay * (attempt + 1))
     return None
@@ -1484,8 +1493,18 @@ def value_profile(p, ratios):
 #     target: current assets minus ALL liabilities, per share.
 
 def _fnum(x):
-    """True only for a real, finite number (rejects None, bool, NaN)."""
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x
+    """True only for a real, finite number. Accepts both Python and NumPy numeric
+    scalars - pandas frequently yields numpy int64/float64, and an earlier
+    isinstance(x, (int, float)) check silently rejected numpy int64, which blanked
+    per-share figures for whole-number rows like share counts. Rejects None, bool,
+    strings, NaN and infinities."""
+    if isinstance(x, bool):
+        return False
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return False
+    return xf == xf and xf not in (float("inf"), float("-inf"))
 
 
 def _clamp(x, lo, hi):
@@ -2864,7 +2883,7 @@ def render_valuation(income, balance, cashflow, currency, ticker,
             "lines). The individual methods that could be computed are listed below."
         )
 
-    cur = currency
+    cur = currency or "JMD"
 
     def money(x):
         return "-" if not _fnum(x) else f"{cur} {x:,.2f}"
@@ -3249,9 +3268,12 @@ def main():
                              "protect against being wrong.") / 100
 
     # Load the three core statements once.
-    income, inc_agg, currency = get_statement(ticker, "Income Statement")
-    balance, bal_agg, _ = get_statement(ticker, "Balance Sheet")
-    cashflow, cf_agg, _ = get_statement(ticker, "Cash Flow")
+    income, inc_agg, cur_i = get_statement(ticker, "Income Statement")
+    balance, bal_agg, cur_b = get_statement(ticker, "Balance Sheet")
+    cashflow, cf_agg, cur_c = get_statement(ticker, "Cash Flow")
+    # Take the currency from whichever statement loaded, so a single failed feed
+    # never leaves it None (which showed up as "None 15.64" in the valuation).
+    currency = cur_i or cur_b or cur_c or "JMD"
 
     if income is None and balance is None:
         st.error(
@@ -3260,6 +3282,17 @@ def main():
             "another ticker."
         )
         return
+
+    missing = [nm for nm, df in (("income statement", income),
+                                 ("balance sheet", balance),
+                                 ("cash-flow statement", cashflow)) if df is None]
+    if missing:
+        st.warning(
+            "Could not load the " + ", ".join(missing) + " for " + ticker
+            + " right now - the data source sometimes throttles rapid requests. "
+            "Figures that depend on it will be blank; reload the page in a moment "
+            "to try again."
+        )
 
     tabs = st.tabs(["Overview", "Verdict", "Income Statement", "Balance Sheet",
                     "Cash Flow", "Decomposition", "Ratios", "Valuation"])
