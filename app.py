@@ -53,6 +53,11 @@ import streamlit as st
 # a flat array (and -1 means "missing"). resolve() below turns it back into
 # ordinary nested data.
 
+# Bump this whenever the data-fetching behaviour changes. It is shown in the
+# sidebar so it is unambiguous which build is actually running (a reboot that
+# doesn't change this string means the deployment is not on the latest commit).
+APP_BUILD = "2026-08-01e income-statement-path"
+
 BASE = "https://stockanalysis.com"
 HEADERS = {
     "User-Agent": (
@@ -133,6 +138,11 @@ def _apply_fx(ticker, df, aggregates, currency):
 # own within a couple of minutes, instead of a 6-hour st.cache_data entry locking
 # a ticker out long after the source has recovered.
 _FETCH_MEMO = {}
+
+# Records, per (ticker, statement), the URLs the loader actually tried and how
+# each turned out - surfaced in the UI when a statement fails to load, so it is
+# obvious which path the running code used (and therefore which build is live).
+_STMT_ATTEMPTS = {}
 
 
 def _memo(key, producer, is_ok, ttl_ok=60 * 60 * 6, ttl_bad=120):
@@ -222,11 +232,17 @@ def _load_statement(ticker, statement):
       * currency  : "JMD" or "USD" as reported.
     Returns (None, None, None) if the statement could not be loaded.
     """
+    attempts = []
     for seg in _statement_segments(statement):
         url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
-        result = _parse_statement(_fetch(url), ticker)
+        raw = _fetch(url)
+        result = _parse_statement(raw, ticker)
+        attempts.append((url, "no response" if raw is None else
+                         ("parsed OK" if result[0] is not None else "no data in page")))
         if result[0] is not None:
+            _STMT_ATTEMPTS[(ticker, statement)] = attempts
             return result
+    _STMT_ATTEMPTS[(ticker, statement)] = attempts
     return None, None, None
 
 
@@ -3313,6 +3329,9 @@ def main():
                         help="How far below fair value you insist on buying, to "
                              "protect against being wrong.") / 100
 
+        st.divider()
+        st.caption(f"Build: {APP_BUILD}")
+
     # Load the three core statements once.
     income, inc_agg, cur_i = get_statement(ticker, "Income Statement")
     balance, bal_agg, cur_b = get_statement(ticker, "Balance Sheet")
@@ -3415,6 +3434,11 @@ def main():
         with tab:
             if df is None:
                 st.warning(f"{sname} is not available for this company.")
+                _att = _STMT_ATTEMPTS.get((ticker, sname))
+                if _att:
+                    st.caption("Data source URLs tried (click to check directly):")
+                    for _u, _outcome in _att:
+                        st.caption(f"- [{_outcome}]({_u}) — {_outcome}")
                 continue
             st.subheader(sname)
             item = st.selectbox("Choose a line item to analyse",
