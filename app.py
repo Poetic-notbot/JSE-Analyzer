@@ -305,6 +305,118 @@ def get_ratios(ticker):
     }
 
 
+# Candidate key names the price-history feed might use for the date and the
+# closing price. The feed is a SvelteKit "__data.json" like the statements, but
+# its exact field names are not documented, so we accept any of these.
+_DATE_KEYS  = ("t", "d", "date", "datekey", "timestamp", "dateFormatted", "dt")
+_CLOSE_KEYS = ("c", "close", "Close", "adjClose", "adjclose", "adj_close", "a", "cl")
+
+
+def _find_price_series(node):
+    """Best-effort: dig an ascending [(date, close), ...] series out of a resolved
+    price-history payload, tolerant of the exact shape/keys the feed uses. Handles
+    both row-of-objects and columnar (parallel-array) layouts. Returns None if no
+    plausible series is found, so callers fall back to other price sources."""
+
+    def rows_to_series(rows):
+        ck = None
+        for k in _CLOSE_KEYS:
+            if any(isinstance(r, dict) and k in r for r in rows):
+                ck = k
+                break
+        if ck is None:
+            return None
+        dk = next((k for k in _DATE_KEYS
+                   if any(isinstance(r, dict) and k in r for r in rows)), None)
+        out = []
+        for r in rows:
+            if isinstance(r, dict) and _fnum(r.get(ck)):
+                out.append((r.get(dk) if dk else None, float(r[ck])))
+        return out if len(out) >= 2 else None
+
+    def columnar(d):
+        ck = next((k for k in _CLOSE_KEYS if isinstance(d.get(k), list)), None)
+        if not ck:
+            return None
+        closes = d[ck]
+        if sum(1 for x in closes if _fnum(x)) < 2:
+            return None
+        dk = next((k for k in _DATE_KEYS
+                   if isinstance(d.get(k), list) and len(d[k]) == len(closes)), None)
+        dates = d[dk] if dk else [None] * len(closes)
+        return [(dt, float(c)) for dt, c in zip(dates, closes) if _fnum(c)]
+
+    best = None
+
+    def walk(x):
+        nonlocal best
+        if best is not None:
+            return
+        if isinstance(x, list):
+            if x and any(isinstance(e, dict) for e in x):
+                s = rows_to_series(x)
+                if s:
+                    best = s
+                    return
+            for e in x:
+                walk(e)
+                if best is not None:
+                    return
+        elif isinstance(x, dict):
+            s = columnar(x)
+            if s:
+                best = s
+                return
+            for v in x.values():
+                walk(v)
+                if best is not None:
+                    return
+
+    walk(node)
+    if not best:
+        return None
+    # Normalise to ascending (oldest -> newest). If dates are present and the
+    # first is later than the last, the feed is newest-first, so reverse it.
+    dated = [t for t in best if t[0] is not None]
+    if len(dated) >= 2 and str(dated[0][0]) > str(dated[-1][0]):
+        best = list(reversed(best))
+    return best
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_price(ticker):
+    """Latest traded price and a 52-week range from the site's price-history feed
+    (https://stockanalysis.com/quote/jmse/<T>/history/). Returns
+        {"price", "date", "low52", "high52", "currency"}   or {} on failure.
+    `currency` is the raw quote currency BEFORE any JMD conversion (USD for the
+    USD reporters, JMD otherwise). Callers convert with the shared FX rate."""
+    url = f"{BASE}/quote/jmse/{ticker}/history/__data.json"
+    raw = _fetch(url)
+    if raw is None:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    series = None
+    for n in obj.get("nodes", []):
+        if isinstance(n, dict) and isinstance(n.get("data"), list):
+            series = _find_price_series(_resolve(n["data"]))
+            if series:
+                break
+    if not series:
+        return {}
+    last_date, last_close = series[-1]
+    window = [c for _, c in series][-252:]          # ~ one trading year
+    return {
+        "price": last_close,
+        "date": last_date,
+        "low52": min(window) if window else None,
+        "high52": max(window) if window else None,
+        "currency": "USD" if ticker.upper() in USD_REPORTERS else "JMD",
+    }
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def get_companies():
     """Return {ticker: name} for all JSE companies, with a fallback list."""
@@ -1464,7 +1576,7 @@ def _perpetual_growth(g_sust, term_g, discount):
 
 
 def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
-                        discount, term_g, currency, ticker, mos=0.25):
+                        discount, term_g, currency, ticker, mos=0.25, quote=None):
     """Build a fair value from several long-standing methods, blend the ones that
     suit this kind of business into a central estimate with a range, and compare
     it to the live market price. All per-share figures are returned in JMD.
@@ -1508,9 +1620,31 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     oeps = per_share(oe)
     fcfps = per_share(p.get("fcf"))
 
+    # Current price. The live traded price from the history feed is preferred, but
+    # only when it sits in a sane band around the market-cap / shares figure, which
+    # acts as an independent anchor - so a misread feed can never post a wild price.
     mcap = (ratios or {}).get("marketcap")
     mcap_jmd = mcap * fx if _fnum(mcap) else None
-    price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
+    derived_price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
+
+    q_price = (quote or {}).get("price")
+    q_jmd = q_price * fx if _fnum(q_price) else None
+
+    price = derived_price
+    price_source = "market cap / shares" if _fnum(derived_price) else None
+    price_date = None
+    quote_ok = False
+    if _fnum(q_jmd) and (derived_price is None or 0.3 <= q_jmd / derived_price <= 3.0):
+        price = q_jmd
+        price_source = "latest close (price history)"
+        price_date = (quote or {}).get("date")
+        quote_ok = True
+
+    # Only trust the 52-week range if the quote itself passed the sanity check.
+    low52 = (quote or {}).get("low52") if quote_ok else None
+    high52 = (quote or {}).get("high52") if quote_ok else None
+    low52_jmd = low52 * fx if _fnum(low52) else None
+    high52_jmd = high52 * fx if _fnum(high52) else None
 
     roe = p.get("roe")
     g1  = _growth_estimate(p, term_g)
@@ -1669,7 +1803,9 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
 
     return {
         "fx": fx, "shares": shares, "currency": currency,
-        "price": price, "eps": eps, "bvps": bvps, "dps": dps,
+        "price": price, "price_source": price_source, "price_date": price_date,
+        "low52": low52_jmd, "high52": high52_jmd,
+        "eps": eps, "bvps": bvps, "dps": dps,
         "oeps": oeps, "fcfps": fcfps, "oe_detail": oe_detail,
         "g1": g1, "g_sust": g_sust, "discount": discount, "term_g": term_g,
         "methods": methods, "n_core": len(core_vals),
@@ -2708,8 +2844,9 @@ def render_valuation(income, balance, cashflow, currency, ticker,
     ctype = detect_company_type(inc_a, bal_a)
     p = build_metric_panel(inc_a, bal_a, cf_a, ctype)
     ratios = get_ratios(ticker)
+    quote = get_price(ticker)
     r = intrinsic_valuation(inc_a, bal_a, cf_a, p, ratios, ctype,
-                            discount, term_g, currency, ticker, mos)
+                            discount, term_g, currency, ticker, mos, quote)
 
     if p["dataConfidence"] == "low":
         st.warning("Limited or unusual data for this company (" + "; ".join(p["dqFlags"])
@@ -2738,9 +2875,11 @@ def render_valuation(income, balance, cashflow, currency, ticker,
         cols[0].metric("Central fair value", money(r["central"]),
                        help=f"Median of {r['n_core']} methods that fit a "
                             f"{type_label.lower()}.")
+        _psrc = r.get("price_source") or "unavailable"
+        _pdate = f" as of {r['price_date']}" if r.get("price_date") else ""
         cols[1].metric("Current price",
                        money(r["price"]) if _fnum(r["price"]) else "n/a",
-                       help="Market cap / shares outstanding (live, cached).")
+                       help=f"Source: {_psrc}{_pdate} (live, cached).")
         if _fnum(r["upside"]):
             cols[2].metric("Upside to fair value", f"{r['upside']*100:+.0f}%",
                            delta=f"{r['upside']*100:+.0f}%", delta_color="normal")
@@ -2764,6 +2903,16 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                 f"Methods span {money(r['low'])} to {money(r['high'])} per share. "
                 "A wide spread means the answer depends heavily on which lens you "
                 "trust; a tight one means the methods agree."
+            )
+
+        if _fnum(r.get("low52")) and _fnum(r.get("high52")):
+            pos = ""
+            if _fnum(r["price"]) and r["high52"] > r["low52"]:
+                frac = (r["price"] - r["low52"]) / (r["high52"] - r["low52"])
+                pos = f" - trading {frac*100:.0f}% of the way up its 12-month range"
+            st.caption(
+                f"52-week price range: {money(r['low52'])} to {money(r['high52'])}"
+                f"{pos}."
             )
 
     st.divider()
@@ -2855,9 +3004,10 @@ def render_valuation(income, balance, cashflow, currency, ticker,
             "the exchange rate - only the JMD figures shown depend on it."
         )
     st.caption(
-        "Every figure is derived from this company's reported statements and the "
-        "site's live market cap. This is a disciplined reading of the numbers, not "
-        "investment advice."
+        "Intrinsic values are derived from this company's reported statements; the "
+        "current price is the latest close from the site's price history (falling "
+        "back to market cap / shares if that feed is unavailable). A disciplined "
+        "reading of the numbers, not investment advice."
     )
 
 
