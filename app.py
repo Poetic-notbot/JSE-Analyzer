@@ -15,8 +15,12 @@ Sheet or Cash Flow Statement to see:
   * a plain-language read of WHAT changed and, for subtotals like "Total
     Assets", WHICH underlying components drove the change,
   * the financial ratios that the chosen item feeds into.
-There is also a Valuation tab (a simple 2-stage discounted-cash-flow estimate
-plus an earnings-multiple cross-check).
+There is also a Valuation tab that builds a fair value from several methods that
+have held up for a very long time - a Buffett owner-earnings DCF, two-stage
+dividend discounting, Earnings Power Value, justified price-to-book for
+financials, Graham's Number and a fair-P/E reversion - each applied only where
+it suits the kind of business, then blended into one central estimate with a
+range and a margin-of-safety buy-below line, and compared to the live price.
 
 Why this version exists
 -----------------------
@@ -1338,6 +1342,382 @@ def value_profile(p, ratios):
 
 
 # ---------------------------------------------------------------------------
+# 2b. INTRINSIC VALUE  — a fair value built from methods that have held up for
+#     a very long time. Each is applied only where it makes sense for the kind
+#     of business, then the sensible ones are blended into one central estimate
+#     with a range and a margin-of-safety buy-below line.
+# ---------------------------------------------------------------------------
+#
+# The methods, and why each has earned its place:
+#   * Owner-earnings DCF (Buffett)  — a business is worth the cash it can be
+#     taken out of it over its life, discounted back. Owner earnings strip out
+#     the accounting noise: net income + depreciation/amortisation (non-cash)
+#     minus the capital spending needed just to stand still.
+#   * Dividend discount / Gordon growth — the oldest rigorous method (John Burr
+#     Williams, 1938; dividends have anchored value for centuries). A share is
+#     worth the dividends it will pay, growing, discounted back.
+#   * Justified price-to-book, (ROE - g)/(r - g) — for banks and insurers value
+#     is driven by book equity and the return earned on it, not by capex/FCF.
+#   * Earnings Power Value (Greenwald) — capitalise today's normalised earnings
+#     assuming *no* growth. A deliberately conservative "what is it worth if it
+#     never grows again" number.
+#   * Graham Number, sqrt(22.5 x EPS x book value/share) — Benjamin Graham's
+#     defensive ceiling (a fair price pays no more than 15x earnings and 1.5x
+#     book). A blunt but durable sanity bound.
+#   * Fair P/E reversion — long-run multiples mean-revert; anchor earnings to a
+#     sober multiple scaled a little for growth and quality.
+#   * Graham's revised formula, EPS x (8.5 + 2g) x 4.4/Y — a growth-and-interest
+#     cross-check, kept off to the side because it is the most assumption-heavy.
+#   * Net current asset value (Graham net-net) — a liquidation FLOOR, never a
+#     target: current assets minus ALL liabilities, per share.
+
+def _fnum(x):
+    """True only for a real, finite number (rejects None, bool, NaN)."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x
+
+
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _median(vals):
+    xs = sorted(v for v in vals if _fnum(v))
+    if not xs:
+        return None
+    n = len(xs)
+    mid = n // 2
+    return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2.0
+
+
+def owner_earnings_base(p):
+    """Buffett 'owner earnings' for the latest year:
+        net income + depreciation & amortisation (non-cash) - maintenance capex.
+    Maintenance capex is approximated as the smaller of actual capex and D&A, so
+    that spending *above* replacement (growth capex) is not charged against the
+    owner, and a company under-spending relative to depreciation is not
+    flattered. Returns (owner_earnings, detail_dict) or (None, {})."""
+    ni = p.get("ni")
+    if not _fnum(ni):
+        return None, {}
+    da = p.get("da") if _fnum(p.get("da")) else 0.0
+    capex = abs(p.get("capex")) if _fnum(p.get("capex")) else 0.0
+    if da and capex:
+        maint = min(capex, da)
+    elif capex:
+        maint = capex
+    else:
+        maint = da                      # no capex figure -> assume ~= depreciation
+    return ni + da - maint, {"ni": ni, "da": da, "capex": capex, "maint_capex": maint}
+
+
+def two_stage_pv(base, g1, term_g, discount, years=10):
+    """Present value of a cash-flow stream that starts at `base` (year 0), grows
+    at g1 in year 1 and fades linearly to `term_g` by the final explicit year,
+    then continues at term_g forever (Gordon terminal value)."""
+    if not _fnum(base) or discount is None:
+        return None
+    if discount <= term_g:
+        term_g = discount - 0.01
+    pv, cf = 0.0, base
+    for yr in range(1, years + 1):
+        g = g1 + (term_g - g1) * (yr - 1) / max(years - 1, 1)
+        cf *= (1 + g)
+        pv += cf / ((1 + discount) ** yr)
+    terminal = cf * (1 + term_g) / (discount - term_g)
+    pv += terminal / ((1 + discount) ** years)
+    return pv
+
+
+def _growth_estimate(p, term_g):
+    """A single, deliberately sober stage-1 growth rate for the DCF: the lower of
+    earnings and revenue CAGR (so a one-off earnings spike can't run away with
+    it), clamped to a sane band and never below the long-term rate."""
+    cands = [g for g in (p.get("niCagr"), p.get("revCagr")) if _fnum(g)]
+    if not cands:
+        g = p.get("ebitCagr") if _fnum(p.get("ebitCagr")) else term_g
+    else:
+        g = min(cands)
+    g = _clamp(g, -0.05, 0.12)
+    return max(g, term_g)
+
+
+def _sustainable_growth(p, term_g, discount):
+    """Near-term reinvestment-funded growth, g = ROE x (1 - payout), used as the
+    *stage-one* rate in the two-stage models. Capped to a sane band and kept below
+    the discount rate."""
+    roe = p.get("roe")
+    if not _fnum(roe) or roe <= 0:
+        return term_g
+    payout = p.get("divToNi")
+    payout = _clamp(payout, 0.0, 1.0) if _fnum(payout) else 0.5
+    g = roe * (1 - payout)
+    return _clamp(g, 0.0, min(0.12, discount - 0.005))
+
+
+def _perpetual_growth(g_sust, term_g, discount):
+    """Growth safe to assume *forever* in a single-stage perpetuity (Gordon /
+    justified price-to-book). High reinvestment growth cannot persist, so it is
+    pulled down to a long-run rate and always kept a comfortable 3 points below
+    the discount rate, which stops these formulas from exploding as g -> r."""
+    gp = min(g_sust, term_g + 0.02)
+    return _clamp(gp, 0.0, max(0.0, discount - 0.03))
+
+
+def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
+                        discount, term_g, currency, ticker, mos=0.25):
+    """Build a fair value from several long-standing methods, blend the ones that
+    suit this kind of business into a central estimate with a range, and compare
+    it to the live market price. All per-share figures are returned in JMD.
+
+    Returns a dict:
+      price, shares, eps, bvps, dps, oeps        -> the per-share building blocks
+      methods  -> list of {name, value, core, applies, basis, why, note}
+      central, low, high, buy_below              -> the blended read + MoS line
+      upside, verdict, band                      -> price vs central
+    """
+    fx = (_FX_CONTEXT.get(ticker, {}) or {}).get("rate") or 1.0
+
+    # Share count. Statements were multiplied by fx to reach JMD, and the share
+    # row rides along with them, so divide it back out. Every per-share number is
+    # then (JMD absolute) / (true shares) = a genuine JMD-per-share figure.
+    shares_scaled = None
+    for src in (balance, income):
+        if src is None:
+            continue
+        for nm in ("Total Common Shares Outstanding", "Shares Outstanding (Basic)",
+                   "Basic Shares Outstanding", "Shares Outstanding",
+                   "Filing Date Shares Outstanding"):
+            if nm in src.index:
+                s = clean_series(src, nm)
+                if len(s) and _fnum(s.iloc[-1]) and s.iloc[-1] > 0:
+                    shares_scaled = float(s.iloc[-1])
+                    break
+        if shares_scaled:
+            break
+    if shares_scaled is None and _fnum(p.get("sharesLast")) and p["sharesLast"] > 0:
+        shares_scaled = float(p["sharesLast"])
+    shares = shares_scaled / fx if shares_scaled else None
+
+    def per_share(total):
+        return (total / shares) if (shares and _fnum(total)) else None
+
+    eps  = per_share(p.get("ni"))
+    bvps = per_share(p.get("equity"))
+    dps  = per_share(p.get("divPaid"))
+    oe, oe_detail = owner_earnings_base(p)
+    oeps = per_share(oe)
+    fcfps = per_share(p.get("fcf"))
+
+    mcap = (ratios or {}).get("marketcap")
+    mcap_jmd = mcap * fx if _fnum(mcap) else None
+    price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
+
+    roe = p.get("roe")
+    g1  = _growth_estimate(p, term_g)
+    g_sust = _sustainable_growth(p, term_g, discount)
+    g_perp = _perpetual_growth(g_sust, term_g, discount)
+
+    fin = ctype in ("bank", "insurer", "holding")
+    methods = []
+
+    def add(name, value, core, applies, basis, why, note=""):
+        methods.append({
+            "name": name,
+            "value": value if (_fnum(value) and value > 0) else None,
+            "core": core and applies and _fnum(value) and value > 0,
+            "applies": applies,
+            "basis": basis,
+            "why": why,
+            "note": note,
+        })
+
+    # --- Owner-earnings DCF (Buffett) -- operating businesses only -----------
+    oe_dcf = None
+    if not fin and _fnum(oeps) and oeps > 0:
+        oe_dcf = two_stage_pv(oeps, g1, term_g, discount, years=10)
+    add("Owner-earnings DCF (Buffett)", oe_dcf, core=True, applies=not fin,
+        basis=f"OE/sh {currency} {oeps:,.2f} - grow {g1*100:.1f}% fading to "
+              f"{term_g*100:.1f}%, discount {discount*100:.1f}%" if _fnum(oeps) else
+              "owner earnings not positive/available",
+        why="A business is worth the cash an owner can pull from it over its life, "
+            "discounted to today. Owner earnings = net income + non-cash "
+            "depreciation - the capex needed just to hold position.",
+        note="" if oe_dcf else "Needs positive owner earnings; skipped.")
+
+    # --- Free-cash-flow DCF (cross-check for operating businesses) -----------
+    fcf_dcf = None
+    if not fin and _fnum(fcfps) and fcfps > 0:
+        fcf_dcf = two_stage_pv(fcfps, g1, term_g, discount, years=10)
+    add("Free-cash-flow DCF", fcf_dcf, core=False, applies=not fin,
+        basis=f"FCF/sh {currency} {fcfps:,.2f}, same growth/discount" if _fnum(fcfps)
+              else "free cash flow not positive/available",
+        why="The same discounting logic run on reported free cash flow, as an "
+            "independent check on the owner-earnings number.")
+
+    # --- Earnings Power Value (Greenwald) -- no-growth capitalised earnings --
+    epv = None
+    if not (ctype in ("bank", "insurer")):
+        nopat = p.get("nopat")
+        if _fnum(nopat) and nopat > 0 and discount:
+            epv_equity = nopat / discount + (p.get("cash") or 0.0) - (p.get("debt") or 0.0)
+            epv = per_share(epv_equity)
+    add("Earnings Power Value", epv, core=True,
+        applies=ctype in ("industrial", "reit", "holding"),
+        basis="NOPAT capitalised at the discount rate, no growth, plus net cash",
+        why="Values only today's proven earning power with zero growth assumed - "
+            "a conservative floor on a profitable, durable business.")
+
+    # --- Justified price-to-book, (ROE - g)/(r - g) -- financials ------------
+    jpb = None
+    if _fnum(roe) and roe > 0 and _fnum(bvps) and bvps > 0 and discount > g_perp:
+        pb_fair = (roe - g_perp) / (discount - g_perp)
+        if pb_fair > 0:
+            jpb = pb_fair * bvps
+    add("Justified price-to-book", jpb, core=fin,
+        applies=fin or ctype == "reit",
+        basis=f"fair P/B = (ROE {(_pct(roe))} - g {g_perp*100:.1f}%) / "
+              f"(r {discount*100:.1f}% - g); x book value/sh {currency} "
+              f"{bvps:,.2f}" if _fnum(bvps) else "book value/share unavailable",
+        why="For banks and insurers value is driven by equity capital and the "
+            "return earned on it. A fair multiple of book falls straight out of "
+            "ROE, growth and the required return.")
+
+    # --- Dividend discount (two-stage) -- any reliable dividend payer --------
+    ddm = None
+    pays = _fnum(dps) and dps > 0
+    if pays:
+        ddm = two_stage_pv(dps, g_sust, term_g, discount, years=10)
+    income_led = fin or ctype == "reit"      # types where payouts drive value
+    add("Dividend discount (two-stage)", ddm, core=(pays and income_led), applies=pays,
+        basis=f"D/sh {currency} {dps:,.2f} grown {g_sust*100:.1f}% fading to "
+              f"{term_g*100:.1f}%, discount {discount*100:.1f}%" if _fnum(dps)
+              else "no dividend paid",
+        why="The oldest rigorous method (Williams, 1938): a share is worth the "
+            "growing stream of dividends it pays, discounted back. Two stages - a "
+            "faster near-term rate settling to a perpetual one - avoid the classic "
+            "blow-up when growth nears the discount rate.",
+        note="" if pays else "Company pays no dividend; not applicable.")
+
+    # --- Graham Number, sqrt(22.5 x EPS x BVPS) -----------------------------
+    graham_n = None
+    if _fnum(eps) and eps > 0 and _fnum(bvps) and bvps > 0:
+        graham_n = (22.5 * eps * bvps) ** 0.5
+    add("Graham Number", graham_n, core=(not fin), applies=True,
+        basis=f"sqrt(22.5 x EPS {currency} {eps:,.2f} x BVPS {currency} {bvps:,.2f})"
+              if (_fnum(eps) and _fnum(bvps)) else "needs positive EPS and book value",
+        why="Graham's defensive ceiling: never pay more than 15x earnings and "
+            "1.5x book (15 x 1.5 = 22.5). A durable upper sanity bound.")
+
+    # --- Fair P/E reversion -------------------------------------------------
+    pe_val = None
+    if _fnum(eps) and eps > 0:
+        pe_fair = 8.0 + 100 * _clamp(g1, 0.0, 0.12)          # 8x .. 20x
+        if _fnum(roe) and roe > 0.18:
+            pe_fair += 1.5
+        pe_ceiling = 15.0 if fin else 20.0    # banks rarely sustain a high multiple
+        pe_fair = _clamp(pe_fair, 7.0, pe_ceiling)
+        pe_val = eps * pe_fair
+    add("Fair P/E reversion", pe_val, core=True, applies=_fnum(eps) and eps > 0,
+        basis=f"EPS {currency} {eps:,.2f} x a growth/quality-scaled multiple"
+              if _fnum(eps) else "needs positive EPS",
+        why="Multiples mean-revert over the long run. Anchor sober, normalised "
+            "earnings to a multiple that leans conservative and only edges up "
+            "for genuine growth and high returns on equity.")
+
+    # --- P/FFO for REITs ----------------------------------------------------
+    if ctype == "reit":
+        ffops = per_share(p.get("ffo"))
+        ffo_val = ffops * 13.0 if (_fnum(ffops) and ffops > 0) else None
+        add("Price / FFO", ffo_val, core=True, applies=True,
+            basis=f"FFO/sh {currency} {ffops:,.2f} x 13" if _fnum(ffops)
+                  else "funds from operations unavailable",
+            why="Property companies are valued on funds from operations (earnings "
+                "plus property depreciation), the cash a rent roll throws off.")
+
+    # --- Graham's revised formula (cross-check, off to the side) ------------
+    graham_rev = None
+    if _fnum(eps) and eps > 0:
+        gpct = 100 * _clamp(g1, 0.0, 0.10)
+        yld = max(discount * 100, 4.4)
+        graham_rev = eps * (8.5 + 2 * gpct) * (4.4 / yld)
+    add("Graham revised formula", graham_rev, core=False,
+        applies=_fnum(eps) and eps > 0,
+        basis="EPS x (8.5 + 2g) x 4.4/required-return",
+        why="Graham's later growth-and-interest formula. Kept as a cross-check "
+            "only - it is the most sensitive to the growth rate you feed it.")
+
+    # --- Net current asset value (liquidation FLOOR, never a target) --------
+    ncav = None
+    if _fnum(p.get("curAssets")) and _fnum(p.get("assets")) and _fnum(p.get("equity")):
+        total_liab = p["assets"] - p["equity"]
+        ncav_total = p["curAssets"] - total_liab
+        ncav = per_share(ncav_total) if ncav_total > 0 else None
+    add("Net current asset value (floor)", ncav, core=False, applies=not fin,
+        basis="current assets - ALL liabilities, per share",
+        why="Graham's net-net: a liquidation floor. Rarely reached, but when the "
+            "price is near it you are getting the operating business for free.")
+
+    # --- Blend the core, applicable methods into a central read -------------
+    core_vals = [m["value"] for m in methods if m["core"]]
+    central = _median(core_vals)
+    low  = min(core_vals) if core_vals else None
+    high = max(core_vals) if core_vals else None
+    buy_below = central * (1 - mos) if _fnum(central) else None
+
+    upside = (central / price - 1) if (_fnum(central) and _fnum(price) and price > 0) else None
+    verdict, band = _valuation_verdict(price, central, buy_below)
+
+    return {
+        "fx": fx, "shares": shares, "currency": currency,
+        "price": price, "eps": eps, "bvps": bvps, "dps": dps,
+        "oeps": oeps, "fcfps": fcfps, "oe_detail": oe_detail,
+        "g1": g1, "g_sust": g_sust, "discount": discount, "term_g": term_g,
+        "methods": methods, "n_core": len(core_vals),
+        "central": central, "low": low, "high": high, "buy_below": buy_below,
+        "mos": mos, "upside": upside, "verdict": verdict, "band": band,
+        "ncav": ncav, "graham_n": graham_n,
+    }
+
+
+def _pct(x):
+    return "-" if not _fnum(x) else "{:.1f}%".format(x * 100)
+
+
+def _valuation_verdict(price, central, buy_below):
+    """Plain-language read of price vs the blended fair value."""
+    if not (_fnum(price) and _fnum(central) and central > 0):
+        return ("No live market price was available, so only the intrinsic "
+                "estimates are shown.", "unknown")
+    if _fnum(buy_below) and price <= buy_below:
+        return ("Trading below fair value with a margin of safety - the kind of "
+                "gap a patient buyer looks for.", "undervalued")
+    if price <= central:
+        return ("Trading below the central fair value, but inside the margin of "
+                "safety cushion rather than clear of it.", "cheap")
+    if price <= central * 1.2:
+        return ("Priced at roughly fair value - close to what the methods say the "
+                "business is worth.", "fair")
+    return ("Priced above the central fair value - the market is assuming more "
+            "than these time-tested methods support.", "expensive")
+
+
+def dcf_sensitivity(base_ps, g1, term_g, currency):
+    """A small grid of Buffett-DCF value/share across discount rate x terminal
+    growth, so the reader can see how much the answer leans on the assumptions."""
+    if not (_fnum(base_ps) and base_ps > 0):
+        return None
+    discounts = [0.10, 0.12, 0.14, 0.16]
+    terms = [0.01, 0.02, 0.03, 0.04]
+    rows = {}
+    for d in discounts:
+        rows[f"{d*100:.0f}% discount"] = {
+            f"g={t*100:.0f}%": two_stage_pv(base_ps, g1, min(t, d - 0.01), d, years=10)
+            for t in terms
+        }
+    return pd.DataFrame(rows).T
+
+
+# ---------------------------------------------------------------------------
 # 3. CHARTS
 # ---------------------------------------------------------------------------
 
@@ -2300,6 +2680,187 @@ def render_verdict(income, balance, cashflow, currency, company_name):
                     + "'>[" + tag + "]</span> " + text + "</div>", unsafe_allow_html=True)
 
 
+_VAL_BAND_COLOR = {
+    "undervalued": "#1a7f37", "cheap": "#2da44e", "fair": "#9a6700",
+    "expensive": "#cf222e", "unknown": "#57606a",
+}
+_VAL_BAND_BG = {
+    "undervalued": "#dafbe1", "cheap": "#dafbe1", "fair": "#fff8c5",
+    "expensive": "#ffebe9", "unknown": "#eaeef2",
+}
+
+
+def render_valuation(income, balance, cashflow, currency, ticker,
+                     discount, term_g, mos):
+    """The Valuation tab: a fair value built from several long-standing methods,
+    blended to a central estimate with a range and a margin-of-safety line, then
+    compared to the live market price."""
+    st.subheader("Valuation - what the business is worth")
+    st.caption(
+        "A fair value assembled from methods that have held up for a very long "
+        "time - a Buffett owner-earnings DCF, dividend discounting, earnings "
+        "power, book-value returns and Graham's bounds - each applied only where "
+        "it fits this kind of business, then blended into one central estimate "
+        "with a range. A tool for judgement, not a target price."
+    )
+
+    inc_a, bal_a, cf_a = _align_to_complete_years(income, balance, cashflow)
+    ctype = detect_company_type(inc_a, bal_a)
+    p = build_metric_panel(inc_a, bal_a, cf_a, ctype)
+    ratios = get_ratios(ticker)
+    r = intrinsic_valuation(inc_a, bal_a, cf_a, p, ratios, ctype,
+                            discount, term_g, currency, ticker, mos)
+
+    if p["dataConfidence"] == "low":
+        st.warning("Limited or unusual data for this company (" + "; ".join(p["dqFlags"])
+                   + "). Treat the valuation as indicative only.")
+
+    type_label = _TYPE_LABEL.get(ctype, "Business")
+    st.markdown("<span style='color:#57606a'>Valued as a <b>" + type_label.lower()
+                + "</b> - the methods below are the ones that suit that.</span>",
+                unsafe_allow_html=True)
+
+    if not _fnum(r["central"]):
+        st.info(
+            "Not enough of the right data to build a fair value for this company "
+            "(it may be a fund, a very new listing, or missing key statement "
+            "lines). The individual methods that could be computed are listed below."
+        )
+
+    cur = currency
+
+    def money(x):
+        return "-" if not _fnum(x) else f"{cur} {x:,.2f}"
+
+    # ---- Headline: central fair value, price, upside, buy-below ------------
+    if _fnum(r["central"]):
+        cols = st.columns(4)
+        cols[0].metric("Central fair value", money(r["central"]),
+                       help=f"Median of {r['n_core']} methods that fit a "
+                            f"{type_label.lower()}.")
+        cols[1].metric("Current price",
+                       money(r["price"]) if _fnum(r["price"]) else "n/a",
+                       help="Market cap / shares outstanding (live, cached).")
+        if _fnum(r["upside"]):
+            cols[2].metric("Upside to fair value", f"{r['upside']*100:+.0f}%",
+                           delta=f"{r['upside']*100:+.0f}%", delta_color="normal")
+        else:
+            cols[2].metric("Upside to fair value", "n/a")
+        cols[3].metric(f"Buy below (-{mos*100:.0f}% MoS)", money(r["buy_below"]),
+                       help="Fair value less your margin of safety - the price at "
+                            "which the odds are tilted your way.")
+
+        # verdict banner
+        bcol = _VAL_BAND_COLOR.get(r["band"], "#57606a")
+        bbg = _VAL_BAND_BG.get(r["band"], "#eaeef2")
+        st.markdown(
+            "<div style='margin:10px 0;padding:12px 16px;border-radius:10px;"
+            "background:" + bbg + ";border:1px solid " + bcol + "44'>"
+            "<span style='font-weight:700;color:" + bcol + "'>" + r["verdict"]
+            + "</span></div>", unsafe_allow_html=True)
+
+        if _fnum(r["low"]) and _fnum(r["high"]):
+            st.caption(
+                f"Methods span {money(r['low'])} to {money(r['high'])} per share. "
+                "A wide spread means the answer depends heavily on which lens you "
+                "trust; a tight one means the methods agree."
+            )
+
+    st.divider()
+
+    # ---- How each method sees it ------------------------------------------
+    st.markdown("#### How each method values it")
+    rows = []
+    for m in r["methods"]:
+        if not m["applies"]:
+            continue
+        vs = "-"
+        if _fnum(m["value"]) and _fnum(r["price"]) and r["price"] > 0:
+            vs = f"{(m['value']/r['price']-1)*100:+.0f}%"
+        rows.append({
+            "Method": ("* " if m["core"] else "") + m["name"],
+            "Fair value / share": money(m["value"]) if _fnum(m["value"]) else "n/a",
+            "vs price": vs,
+            "In blend": "yes" if m["core"] else "-",
+            "What it assumes": m["basis"],
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption("Rows marked * are blended into the central fair value. Others "
+                   "are cross-checks, floors or ceilings shown for context.")
+
+    # ---- Buffett owner-earnings DCF, in detail ----------------------------
+    oe_method = next((m for m in r["methods"]
+                      if m["name"].startswith("Owner-earnings")), None)
+    if oe_method and _fnum(oe_method["value"]):
+        with st.expander("Buffett owner-earnings DCF - the assumptions, and how "
+                         "sensitive it is", expanded=True):
+            d = r["oe_detail"]
+            st.markdown(
+                f"**Owner earnings** = net income {money(d.get('ni'))} "
+                f"+ depreciation & amortisation {money(d.get('da'))} "
+                f"- maintenance capex {money(d.get('maint_capex'))} "
+                f"= **{money((d.get('ni') or 0)+(d.get('da') or 0)-(d.get('maint_capex') or 0))}**, "
+                f"or {money(r['oeps'])} per share."
+            )
+            st.markdown(
+                f"Grown at **{r['g1']*100:.1f}%** in year one (the lower of earnings "
+                f"and revenue CAGR, capped), fading to **{term_g*100:.1f}%** by year "
+                f"ten, then held there forever. Discounted at **{discount*100:.1f}%**."
+            )
+            grid = dcf_sensitivity(r["oeps"], r["g1"], term_g, cur)
+            if grid is not None:
+                st.markdown("**Value per share across assumptions** (discount rate "
+                            "down the side, terminal growth across the top):")
+                disp = grid.copy()
+                for _c in disp.columns:
+                    disp[_c] = disp[_c].map(lambda x: money(x) if _fnum(x) else "-")
+                st.dataframe(disp, use_container_width=True)
+                st.caption("If the value swings wildly across this grid, the DCF is "
+                           "leaning hard on assumptions - lean more on the "
+                           "book-value, dividend and Graham methods instead.")
+
+    # ---- Floors & ceilings ------------------------------------------------
+    bits = []
+    if _fnum(r["ncav"]):
+        bits.append(f"**Liquidation floor (net-net):** {money(r['ncav'])} - current "
+                    "assets less all debt, per share.")
+    if _fnum(r["graham_n"]):
+        bits.append(f"**Graham ceiling:** {money(r['graham_n'])} - the most a "
+                    "defensive buyer should pay on earnings and book together.")
+    if bits:
+        st.markdown("#### Floors & ceilings")
+        for b in bits:
+            st.markdown("- " + b)
+
+    # ---- Why these methods -------------------------------------------------
+    with st.expander("Why these methods - and why they have lasted"):
+        for m in r["methods"]:
+            if not m["applies"]:
+                continue
+            st.markdown("**" + m["name"] + ".** " + m["why"]
+                        + (("  \n_" + m["note"] + "_") if m["note"] else ""))
+
+    # ---- Assumptions & FX footnote ----------------------------------------
+    st.caption(
+        f"Assumptions (all editable in the sidebar): discount / required return "
+        f"{discount*100:.1f}%, long-term growth {term_g*100:.1f}%, margin of safety "
+        f"{mos*100:.0f}%. Stage-one growth used: {r['g1']*100:.1f}%."
+    )
+    _fxc = _FX_CONTEXT.get(ticker, {})
+    if _fxc.get("reported") == "USD":
+        st.caption(
+            f"Reported in USD; converted to JMD at {_fxc.get('rate', 0):,.2f} "
+            "(live rate, 6-hour cache). The over/under-valued read is unaffected by "
+            "the exchange rate - only the JMD figures shown depend on it."
+        )
+    st.caption(
+        "Every figure is derived from this company's reported statements and the "
+        "site's live market cap. This is a disciplined reading of the numbers, not "
+        "investment advice."
+    )
+
+
 # 4. USER INTERFACE
 # ---------------------------------------------------------------------------
 
@@ -2527,8 +3088,15 @@ def main():
         ticker = sym_by_label[chosen]
 
         st.header("Valuation assumptions")
-        discount = st.slider("Discount rate (%)", 6.0, 20.0, 12.0, 0.5) / 100
-        term_g = st.slider("Long-term growth (%)", 0.0, 5.0, 2.0, 0.5) / 100
+        discount = st.slider("Discount rate / required return (%)", 6.0, 20.0, 12.0, 0.5,
+                             help="What you need to earn to bother owning it. JMD "
+                                  "required returns are typically 12-16%.") / 100
+        term_g = st.slider("Long-term growth (%)", 0.0, 5.0, 2.0, 0.5,
+                           help="Perpetual growth after the explicit forecast. Keep "
+                                "it at or below long-run GDP + inflation.") / 100
+        mos = st.slider("Margin of safety (%)", 0.0, 50.0, 25.0, 5.0,
+                        help="How far below fair value you insist on buying, to "
+                             "protect against being wrong.") / 100
 
     # Load the three core statements once.
     income, inc_agg, currency = get_statement(ticker, "Income Statement")
@@ -2743,54 +3311,8 @@ def main():
 
     # ---- Valuation --------------------------------------------------------
     with tabs[7]:
-        st.subheader("Valuation (estimate)")
-        st.caption(
-            "A simple 2-stage discounted-cash-flow model with an earnings-multiple "
-            "cross-check. Treat as a starting point for your own judgement, not a "
-            "target price."
-        )
-        shares = None
-        if balance is not None:
-            for nm in ("Total Common Shares Outstanding", "Shares Outstanding",
-                       "Filing Date Shares Outstanding"):
-                if nm in balance.index:
-                    sh = clean_series(balance, nm)
-                    if len(sh):
-                        shares = sh.iloc[-1]
-                        break
-        val = estimate_valuation(income, balance, cashflow, shares, None,
-                                 discount, term_g)
-        if "dcf_per_share" in val:
-            st.metric("DCF value per share",
-                      f"{currency} {val['dcf_per_share']:,.2f}",
-                      help=f"FCF growth assumed: {val.get('fcf_growth_used', 0)*100:.1f}%")
-        else:
-            st.info("Free cash flow was not positive/available, so a DCF estimate "
-                    "could not be produced. The earnings cross-check below may still help.")
-        if "pe_value_12x" in val:
-            st.metric("Value at 12x earnings",
-                      f"{currency} {val['pe_value_12x']:,.2f}",
-                      help=f"Latest EPS: {currency} {val.get('eps', 0):,.2f}")
-        _fxc = _FX_CONTEXT.get(ticker, {})
-        if _fxc.get("reported") == "USD":
-            st.caption(
-                f"Reported in USD; converted to JMD at {_fxc.get('rate', 0):,.2f} "
-                "(live rate, 6-hour cache)."
-            )
-        _dcf = val.get("dcf_per_share")
-        _mult = val.get("pe_value_12x")
-        if isinstance(_dcf, (int, float)) and isinstance(_mult, (int, float)) and _mult:
-            if _dcf < 0.6 * _mult:
-                st.info(
-                    "The DCF sits well below the earnings multiple. That is usually "
-                    "real, not an error: this business turns relatively little profit "
-                    "into free cash flow and/or carries net debt, both of which the "
-                    "DCF captures but a simple earnings multiple does not."
-                )
-            else:
-                st.caption("DCF and the earnings multiple broadly agree.")
-        st.caption("Adjust the discount rate and long-term growth in the sidebar "
-                   "to test how sensitive the estimate is.")
+        render_valuation(income, balance, cashflow, currency, ticker,
+                         discount, term_g, mos)
 
 
 if __name__ == "__main__":

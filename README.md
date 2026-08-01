@@ -60,5 +60,28 @@ The original Streamlit app for analysing companies listed on the Jamaica Stock
 Exchange remains available and unchanged. Pick a company and drill into any line
 item on its Income Statement, Balance Sheet or Cash Flow Statement to see how it
 changed over time, its growth, its share of the relevant total, a plain-language
-read of what drove the change, the ratios it feeds into, and a simple valuation.
+read of what drove the change, and the ratios it feeds into.
 Figures are read live from stockanalysis.com. Run it with `streamlit run app.py`.
+
+### Valuation
+
+The **Valuation** tab estimates what a company is worth using methods that have
+endured for a very long time, each applied only where it fits the business:
+
+- **Owner-earnings DCF (Buffett)** — net income + depreciation − maintenance
+  capex, grown over ten years and discounted back (operating businesses).
+- **Dividend discount (two-stage / Gordon)** — value as the growing stream of
+  dividends, discounted (any reliable payer; core for banks, insurers, REITs).
+- **Justified price-to-book**, `(ROE − g)/(r − g)` — book equity and the return
+  on it, the right lens for financials.
+- **Earnings Power Value** (Greenwald) — today's normalised earnings capitalised
+  with *no* growth assumed; a deliberately conservative floor.
+- **Graham Number**, `√(22.5 × EPS × book value/share)` — Graham's defensive
+  ceiling, and **net-net** current-asset value as a liquidation floor.
+- **Fair-P/E reversion** and **Graham's revised formula** as cross-checks.
+
+The methods that suit the business are blended into a **central fair value** with
+a low–high range, then compared to the live market price to show upside/downside
+and a **margin-of-safety** buy-below line. A discount-rate × terminal-growth grid
+shows how sensitive the DCF is to its assumptions. Discount rate, long-term
+growth and margin of safety are all adjustable in the sidebar.
