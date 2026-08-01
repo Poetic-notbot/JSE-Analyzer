@@ -200,6 +200,16 @@ def get_statement(ticker, statement):
                  lambda r: r is not None and r[0] is not None)
 
 
+def _statement_segments(statement):
+    """URL segment(s) to try for a statement, in order. The income statement is
+    served at BOTH the bare /financials/ path (historically) and the named
+    /financials/income-statement/ path; the site has flipped between them, so we
+    try both and use whichever actually parses. The others have one stable path."""
+    if statement == "Income Statement":
+        return ["income-statement/", ""]
+    return [STATEMENTS[statement]]
+
+
 def _load_statement(ticker, statement):
     """
     Return one financial statement for a ticker as a tidy table.
@@ -212,14 +222,17 @@ def _load_statement(ticker, statement):
       * currency  : "JMD" or "USD" as reported.
     Returns (None, None, None) if the statement could not be loaded.
     """
-    seg = STATEMENTS[statement]
-    url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
-    raw = _fetch(url)
-    if raw is None and statement == "Income Statement":
-        # The income statement moved from /financials/ to /financials/income-
-        # statement/. Fall back to the legacy bare path in case a ticker (or a
-        # future site change) still serves it there.
-        raw = _fetch(f"{BASE}/quote/jmse/{ticker}/financials/__data.json")
+    for seg in _statement_segments(statement):
+        url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
+        result = _parse_statement(_fetch(url), ticker)
+        if result[0] is not None:
+            return result
+    return None, None, None
+
+
+def _parse_statement(raw, ticker):
+    """Turn one statement's raw __data.json text into (df, aggregates, currency),
+    or (None, None, None) if it is missing/unparseable/empty."""
     if raw is None:
         return None, None, None
     try:
