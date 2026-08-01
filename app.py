@@ -61,9 +61,12 @@ HEADERS = {
     )
 }
 
-# Each financial statement and the URL segment it lives under.
+# Each financial statement and the URL segment it lives under. The income
+# statement used to live at the bare /financials/ path; the site has since moved
+# it to the named /financials/income-statement/ path (matching the others), so
+# the old empty segment now 404s for every ticker.
 STATEMENTS = {
-    "Income Statement": "",                       # /financials/
+    "Income Statement": "income-statement/",      # /financials/income-statement/
     "Balance Sheet": "balance-sheet/",            # /financials/balance-sheet/
     "Cash Flow": "cash-flow-statement/",          # /financials/cash-flow-statement/
     "Ratios": "ratios/",                          # /financials/ratios/
@@ -212,6 +215,11 @@ def _load_statement(ticker, statement):
     seg = STATEMENTS[statement]
     url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
     raw = _fetch(url)
+    if raw is None and statement == "Income Statement":
+        # The income statement moved from /financials/ to /financials/income-
+        # statement/. Fall back to the legacy bare path in case a ticker (or a
+        # future site change) still serves it there.
+        raw = _fetch(f"{BASE}/quote/jmse/{ticker}/financials/__data.json")
     if raw is None:
         return None, None, None
     try:
