@@ -125,14 +125,28 @@ def _apply_fx(ticker, df, aggregates, currency):
 
 
 
-def _fetch(url, retries=5, delay=1.4):
-    """Download a URL's text, retrying politely on transient failures.
+# Process-wide cache that keeps GOOD fetch results for a long time but remembers
+# FAILURES only briefly - so a transient block on stockanalysis.com clears on its
+# own within a couple of minutes, instead of a 6-hour st.cache_data entry locking
+# a ticker out long after the source has recovered.
+_FETCH_MEMO = {}
 
-    A 404 is a definitive 'not covered' and returns immediately. Throttling
-    (429) and forbidden (403) responses - which the site returns under rapid
-    sequential requests, and which caused single statements to intermittently
-    fail to load - get a longer, escalating backoff so they usually recover
-    within the retry budget."""
+
+def _memo(key, producer, is_ok, ttl_ok=60 * 60 * 6, ttl_bad=120):
+    now = time.time()
+    hit = _FETCH_MEMO.get(key)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    value = producer()
+    _FETCH_MEMO[key] = (now + (ttl_ok if is_ok(value) else ttl_bad), value)
+    return value
+
+
+def _fetch(url, retries=4, delay=1.4):
+    """Download a URL's text, retrying politely on transient failures. A 404 is a
+    definitive 'not covered' and returns immediately; other errors get a short,
+    escalating backoff. Deliberately gentle - hammering a throttling source only
+    deepens the throttle."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
@@ -141,10 +155,7 @@ def _fetch(url, retries=5, delay=1.4):
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
-            wait = delay * (attempt + 1)
-            if exc.code in (403, 429):                # throttled: back off harder
-                wait = delay * (attempt + 1) * 2.0
-            time.sleep(wait)
+            time.sleep(delay * (attempt + 1))
         except Exception:
             time.sleep(delay * (attempt + 1))
     return None
@@ -179,8 +190,14 @@ def _resolve(flat):
     return walk(0)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_statement(ticker, statement):
+    """Cached wrapper: keeps a good statement 6h, retries a failed one after ~2min."""
+    return _memo(("stmt", ticker, statement),
+                 lambda: _load_statement(ticker, statement),
+                 lambda r: r is not None and r[0] is not None)
+
+
+def _load_statement(ticker, statement):
     """
     Return one financial statement for a ticker as a tidy table.
 
@@ -270,8 +287,12 @@ def get_statement(ticker, statement):
     return _apply_fx(ticker, df, aggregates, currency)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_ratios(ticker):
+    """Cached wrapper: keeps good ratios 6h, retries an empty result after ~2min."""
+    return _memo(("ratios", ticker), lambda: _load_ratios(ticker), lambda r: bool(r))
+
+
+def _load_ratios(ticker):
     """Current (TTM) valuation ratios from stockanalysis.com's ratios feed.
     Index 0 of each per-period array is the TTM/most-recent column.
     Returns {} on any failure (callers must degrade gracefully)."""
@@ -392,8 +413,12 @@ def _find_price_series(node):
     return best
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_price(ticker):
+    """Cached wrapper: keeps a good price 6h, retries an empty result after ~2min."""
+    return _memo(("price", ticker), lambda: _load_price(ticker), lambda r: bool(r))
+
+
+def _load_price(ticker):
     """Latest traded price and a 52-week range from the site's price-history feed
     (https://stockanalysis.com/quote/jmse/<T>/history/). Returns
         {"price", "date", "low52", "high52", "currency"}   or {} on failure.
