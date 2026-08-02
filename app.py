@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02i quality + liquidity"
+APP_BUILD = "2026-08-02j scenarios + comparables"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -1799,6 +1799,30 @@ def implied_growth(base_ps, price, term_g, discount, finite=False, years=10, res
         mid = 0.5 * (lo + hi)
         (lo, hi) = (mid, hi) if pv(mid) < price else (lo, mid)
     return ("solved", 0.5 * (lo + hi))
+
+
+def scenario_values(base_ps, g1, term_g, discount, finite=False, years=10, residual=0.0):
+    """Bear / base / bull fair values per share: the base case is your assumptions;
+    bear cuts growth and demands a higher return; bull does the opposite. Makes the
+    uncertainty explicit instead of hiding it inside a single number."""
+    if not (_fnum(base_ps) and base_ps > 0):
+        return {}
+
+    def val(g, d):
+        d = max(d, term_g + 0.02)
+        return (finite_pv(base_ps, g, term_g, d, years, residual) if finite
+                else two_stage_pv(base_ps, g, term_g, d, years=10))
+
+    return {
+        "bear": val(max(term_g, g1 - 0.05), discount + 0.02),
+        "base": val(g1, discount),
+        "bull": val(g1 + 0.03, discount - 0.02),
+        "assumptions": {
+            "bear": (max(term_g, g1 - 0.05), discount + 0.02),
+            "base": (g1, discount),
+            "bull": (g1 + 0.03, discount - 0.02),
+        },
+    }
 
 
 def growth_reasonableness(g_impl, p):
@@ -4060,6 +4084,61 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                    f"{term_g*100:.0f}%" + (f", {int(yrs)}-yr life" if finite else "")
                    + f", on {base_label} of {money(base_ps)}/share.")
 
+    # ---- Bear / base / bull scenarios -------------------------------------
+    if _fnum(base_ps) and base_ps > 0:
+        sc = scenario_values(base_ps, r["g1"], term_g, discount,
+                             finite=bool(r.get("asset_life")),
+                             years=r.get("asset_life") or 10)
+        if sc and _fnum(sc.get("base")):
+            st.markdown("#### Scenarios")
+            st.caption("One number hides the risk. Here the base case is your "
+                       "assumptions; the bear case cuts growth 5 points and demands "
+                       "2% more return; the bull case does the reverse.")
+            a = sc["assumptions"]
+            scols = st.columns(3)
+            for i, (nm, key) in enumerate([("Bear", "bear"), ("Base", "base"),
+                                           ("Bull", "bull")]):
+                v = sc.get(key)
+                g_, d_ = a[key]
+                up = (v / r["price"] - 1) if (_fnum(v) and _fnum(r.get("price"))
+                                              and r["price"] > 0) else None
+                scols[i].metric(f"{nm} fair value", money(v),
+                                (f"{up*100:+.0f}% vs price" if _fnum(up) else None),
+                                delta_color="off",
+                                help=f"growth {g_*100:.0f}%, discount {d_*100:.0f}%")
+            if _fnum(sc.get("bear")) and _fnum(r.get("price")):
+                if r["price"] <= sc["bear"]:
+                    st.markdown("<span style='color:#1a7f37'>Price is below even the "
+                                "bear case - a genuine margin of safety.</span>",
+                                unsafe_allow_html=True)
+                elif _fnum(sc.get("bull")) and r["price"] > sc["bull"]:
+                    st.markdown("<span style='color:#cf222e'>Price is above even the "
+                                "bull case - a lot has to go right.</span>",
+                                unsafe_allow_html=True)
+
+    # ---- Comparables vs sector (peer-relative cross-check) ----------------
+    _sm = st.session_state.get("sector_medians", {}).get(type_label)
+    if _sm:
+        peer_bits = []
+        if _fnum(_sm.get("P/E")) and _fnum(r.get("eps")) and r["eps"] > 0:
+            peer_bits.append(("on its sector's median P/E of "
+                              f"{_sm['P/E']:.1f}x", _sm["P/E"] * r["eps"]))
+        if _fnum(_sm.get("P/B")) and _fnum(r.get("bvps")) and r["bvps"] > 0:
+            peer_bits.append(("on its sector's median P/B of "
+                              f"{_sm['P/B']:.1f}x", _sm["P/B"] * r["bvps"]))
+        if peer_bits:
+            st.markdown("#### Comparables (vs sector)")
+            for basis, val in peer_bits:
+                vs = ""
+                if _fnum(r.get("price")) and r["price"] > 0:
+                    vs = f" - that's {(val/r['price']-1)*100:+.0f}% vs today's price"
+                st.markdown(f"- Valued {basis}: **{money(val)}**{vs}.")
+            st.caption("Peer medians come from the Compare page's scored universe. A "
+                       "name can be cheap on its own yet dear versus its industry.")
+    elif not st.session_state.get("sector_medians"):
+        st.caption("Tip: open the **Compare companies** page once to load sector "
+                   "medians, then this tab adds a peer-relative cross-check.")
+
     # ---- Asset backing & downside -----------------------------------------
     b = r.get("backing") or {}
     if b:
@@ -4219,6 +4298,14 @@ def build_universe():
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+        # Stash sector medians so the single-company Valuation tab can add a
+        # peer-relative comparables cross-check.
+        try:
+            med = (df.groupby("Type")[["P/E", "P/B", "Div yield %"]]
+                   .median(numeric_only=True))
+            st.session_state["sector_medians"] = med.to_dict("index")
+        except Exception:
+            pass
     return df
 
 
