@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02n ratios rows parser"
+APP_BUILD = "2026-08-02o per-share xray + ratios current"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -389,45 +389,33 @@ def get_ratios(ticker):
 
 
 def _load_ratios(ticker):
-    """Current (TTM) valuation ratios from stockanalysis.com's ratios feed.
-    Index 0 of each per-period array is the TTM/most-recent column.
-    Returns {} on any failure (callers must degrade gracefully)."""
-    url = f"{BASE}/quote/{_exchange_of(ticker)}/{ticker}/financials/ratios/__data.json"
-    raw = _fetch(url)
-    if raw is None:
-        return {}
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return {}
-    node = None
-    for n in obj.get("nodes", []):
-        if isinstance(n, dict) and isinstance(n.get("data"), list):
-            rr = _resolve(n["data"])
-            if isinstance(rr, dict) and "marketcap" in rr and "evebit" in rr:
-                node = rr
-                break
-    if node is None:
+    """Current valuation ratios from the ratios feed, read from its 'Current'
+    column. Handles both the current row-based (statement-style) layout and the
+    legacy flat layout. Returns {} on failure (callers degrade gracefully)."""
+    full = _ratios_rows(ticker)
+    if not full or not full.get("rows"):
         return {}
 
-    def first(key):
-        v = node.get(key)
-        if isinstance(v, list) and v and isinstance(v[0], (int, float)):
-            return float(v[0])
-        return None
+    def cur(*titles, pct=False):
+        _by, vals, c = _ratio_series(full, *titles)
+        if c is None:
+            c = vals[-1] if vals else None            # fall back to latest year
+        if c is not None and pct and abs(c) > 1:      # percent -> fraction
+            c = c / 100.0
+        return c
 
     return {
-        "marketcap":     first("marketcap"),
-        "ev":            first("ev"),
-        "pe":            first("pe"),
-        "pb":            first("pb"),
-        "ptbv":          first("ptbvRatio"),
-        "evEbit":        first("evebit"),
-        "evEbitda":      first("evebitda"),
-        "earningsYield": first("earningsyield"),
-        "dividendYield": first("dividendyield"),
-        "roicSite":      first("roic"),
-        "currentRatio":  first("currentratio"),
+        "marketcap":     cur("marketcap", "Market Capitalization"),
+        "ev":            cur("ev", "Enterprise Value"),
+        "pe":            cur("pe", "PE Ratio", "P/E Ratio"),
+        "pb":            cur("pb", "PB Ratio", "P/B Ratio"),
+        "ptbv":          cur("ptbvRatio", "P/TBV Ratio"),
+        "evEbit":        cur("evebit", "EV/EBIT Ratio"),
+        "evEbitda":      cur("evebitda", "EV/EBITDA Ratio"),
+        "earningsYield": cur("earningsyield", "Earnings Yield", pct=True),
+        "dividendYield": cur("dividendyield", "Dividend Yield", pct=True),
+        "roicSite":      cur("roic", "Return on Invested Capital (ROIC)", "ROIC", pct=True),
+        "currentRatio":  cur("currentratio", "Current Ratio"),
     }
 
 
@@ -487,6 +475,8 @@ def _ratio_row(full, *titles):
             return v
     if not flat:
         for t in titles:
+            if len(t) <= 4:                     # short keys (ev/pe/pb) are exact-only
+                continue                        # to avoid matching e.g. "EV/EBIT Ratio"
             for title, arr in rows.items():
                 if isinstance(arr, list) and t.lower() in str(title).lower():
                     return arr
@@ -1726,6 +1716,12 @@ def value_profile(p, ratios):
     """Fundamentals panel p + TTM site ratios -> valuation anchors + clues."""
     v = dict(ratios) if ratios else {}
     mcap = v.get("marketcap")
+    # The feed reports market cap "in millions", an ambiguous scale. Reconstruct it
+    # unit-safe from P/E x net income (P/E is dimensionless, net income full-unit)
+    # so the yield/multiple clues below can't be thrown off by a units mismatch.
+    if _fnum(v.get("pe")) and v["pe"] > 0 and _fnum(p.get("ni")) and p["ni"] > 0:
+        mcap = v["pe"] * p["ni"]
+        v["marketcap"] = mcap
 
     v["fcfYield"]  = _safe_div(p.get("fcf"), mcap)
     v["priceToNi"] = _safe_div(mcap, p.get("ni"))                 # years of net income
@@ -2017,6 +2013,93 @@ def asset_backing(balance, p, shares, recovery=None):
     }
 
 
+def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
+    """Every balance-sheet and income line divided by shares, alongside the price,
+    plus a RIGOROUS set of undervaluation signals. Rigour matters: a gross asset
+    (or revenue) above the price is NOT cheap on its own - it is usually funded by
+    debt, or is low-margin. Only figures net of ALL liabilities, or sales backed by
+    real margins, are treated as signals. Everything else is shown for context only."""
+    if not (shares and shares > 0):
+        return {}
+
+    def ps(v):
+        return (v / shares) if _fnum(v) else None
+
+    cash = p.get("cash") or 0.0
+    debt = p.get("debt") or 0.0
+    assets = p.get("assets")
+    equity = p.get("equity")
+    curassets = p.get("curAssets")
+    invest = _last(_pick(balance, "Total Investments", "Long-Term Investments"))
+    recv = _last(_pick(balance, "Receivables", "Accounts Receivable", "Net Receivables"))
+    invy = _last(_pick(balance, "Inventory", "Inventories"))
+    ppe = p.get("ppe")
+    total_liab = (assets - equity) if (_fnum(assets) and _fnum(equity)) else None
+
+    asset_items = [("Cash & equivalents", cash), ("Investments", invest),
+                   ("Receivables", recv), ("Inventory", invy),
+                   ("Property, plant & equipment", ppe)]
+    known = sum(v for _, v in asset_items if _fnum(v))
+    if _fnum(assets):
+        asset_items.append(("Other assets", max(assets - known, 0.0)))
+    assets_ps = [(lbl, ps(v)) for lbl, v in asset_items if _fnum(v) and abs(v) > 0]
+
+    liab_ps = [(lbl, ps(v)) for lbl, v in
+               [("Total debt", debt), ("Current liabilities", p.get("curLiab")),
+                ("All liabilities", total_liab)] if _fnum(v) and abs(v) > 0]
+
+    income_ps = [(lbl, ps(v)) for lbl, v in
+                 [("Revenue", p.get("rev")),
+                  ("Gross profit", _last(_pick(income, "Gross Profit"))),
+                  ("Operating income (EBIT)", p.get("ebitUsed")),
+                  ("Net income (EPS)", p.get("ni")),
+                  ("Free cash flow", p.get("fcf"))] if _fnum(v)]
+
+    # --- Rigorous signals ---------------------------------------------------
+    net_cash_ps = ps(cash - debt)
+    ncav_ps = ps(curassets - total_liab) if (_fnum(curassets) and _fnum(total_liab)) else None
+    book_ps = ps(equity)
+    rev_ps = ps(p.get("rev"))
+    nm = p.get("netMargin")
+    fin = ctype in ("reit", "bank", "insurer", "holding")
+
+    signals, notes = [], []
+    if _fnum(price) and price > 0:
+        if _fnum(net_cash_ps) and net_cash_ps >= price:
+            signals.append(("strong", f"Price is at or below **net cash per share** "
+                            f"({net_cash_ps:,.2f}) - the market is valuing the whole "
+                            "operating business at zero or less."))
+        elif _fnum(ncav_ps) and ncav_ps >= price:
+            signals.append(("strong", f"Price is at or below **net current asset value** "
+                            f"({ncav_ps:,.2f}) - current assets alone, net of ALL "
+                            "liabilities, exceed the price (a Graham net-net)."))
+        if _fnum(book_ps) and book_ps >= price:
+            if fin:
+                signals.append(("moderate", f"Price is below **book value** "
+                                f"({book_ps:,.2f}), which for this kind of company is "
+                                "close to net asset value - a real discount to NAV."))
+            else:
+                signals.append(("weak", f"Price is below **book value** ({book_ps:,.2f}, "
+                                "P/B < 1). Book here is historical cost, so confirm the "
+                                "assets are productive before calling it cheap."))
+        if _fnum(rev_ps) and rev_ps >= price:
+            if _fnum(nm) and nm >= 0.08:
+                signals.append(("moderate", f"Price is below **annual revenue per share** "
+                                f"({rev_ps:,.2f}) on a healthy {nm*100:.0f}% net margin "
+                                f"(P/S {price/rev_ps:.2f}) - a low sales multiple on a "
+                                "genuinely profitable business."))
+            else:
+                notes.append("Revenue per share is above the price (P/S < 1), but the "
+                             "net margin is thin, so a low sales multiple is normal "
+                             "here - not a reliable signal on its own.")
+    return {
+        "assets": assets_ps, "assets_total": ps(assets),
+        "liab": liab_ps, "book_ps": book_ps,
+        "income": income_ps, "signals": signals, "notes": notes,
+        "price": price,
+    }
+
+
 def _growth_estimate(p, term_g):
     """A single, deliberately sober stage-1 growth rate for the DCF: the lower of
     earnings and revenue CAGR (so a one-off earnings spike can't run away with
@@ -2132,7 +2215,10 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     price_source = "market cap / shares" if _fnum(derived_price) else None
     price_date = None
     quote_ok = False
-    if _fnum(q_jmd) and (derived_price is None or 0.3 <= q_jmd / derived_price <= 3.0):
+    # The live quote already passed the book-value currency anchor above, so trust
+    # it whenever present; market-cap/shares is only a fallback (its 'in millions'
+    # scale is ambiguous and must never override a validated quote).
+    if _fnum(q_jmd):
         price = q_jmd
         price_source = "latest close (price history)"
         price_date = (quote or {}).get("date")
@@ -4394,6 +4480,64 @@ def render_valuation(income, balance, cashflow, currency, ticker,
         st.caption(f"Graham ceiling (upper sanity bound): {money(r['graham_n'])} - the "
                    "most a defensive buyer should pay on earnings and book together.")
 
+    # ---- Per-share X-ray --------------------------------------------------
+    xr = per_share_xray(inc_a, bal_a, cf_a, p, r.get("shares"), r.get("price"), ctype)
+    if xr:
+        st.divider()
+        st.markdown("#### Per-share X-ray")
+        price = xr.get("price")
+        st.caption(
+            "Every line divided by shares, next to the price"
+            + (f" of {money(price)}" if _fnum(price) else "")
+            + ". **A single figure above the price is not 'cheap' on its own** - "
+            "gross assets are usually funded by debt, and low sales multiples are "
+            "normal for thin-margin businesses. Only the signals at the bottom, "
+            "which net off all liabilities or require real margins, are treated as "
+            "genuine indications."
+        )
+
+        def _tbl(title, items, total=None):
+            rows = []
+            for lbl, v in items:
+                pctp = (f"{v/price*100:,.0f}%" if (_fnum(v) and _fnum(price) and price > 0) else "-")
+                above = _fnum(v) and _fnum(price) and v >= price
+                rows.append({"Line": ("● " if above else "") + lbl,
+                             "Per share": money(v), "% of price": pctp})
+            if total is not None and _fnum(total):
+                rows.append({"Line": "Total", "Per share": money(total),
+                             "% of price": (f"{total/price*100:,.0f}%"
+                                            if _fnum(price) and price > 0 else "-")})
+            if rows:
+                st.markdown(f"**{title}**")
+                st.dataframe(pd.DataFrame(rows), hide_index=True,
+                             use_container_width=True)
+
+        xc = st.columns(2)
+        with xc[0]:
+            _tbl("Assets / share", xr["assets"], xr.get("assets_total"))
+            _tbl("Liabilities / share", xr["liab"])
+        with xc[1]:
+            _tbl("Income / share (per year)", xr["income"])
+            if _fnum(xr.get("book_ps")):
+                st.markdown("**Equity / share**")
+                st.dataframe(pd.DataFrame([{"Line": "Book value", "Per share":
+                            money(xr["book_ps"]), "% of price":
+                            (f"{xr['book_ps']/price*100:,.0f}%" if _fnum(price) and price > 0 else "-")}]),
+                            hide_index=True, use_container_width=True)
+        st.caption("● marks a line whose per-share value sits at or above the price.")
+
+        if xr["signals"]:
+            st.markdown("**What actually signals undervaluation here:**")
+            _sc = {"strong": "#1a7f37", "moderate": "#1a7f37", "weak": "#9a6700"}
+            for kind, txt in xr["signals"]:
+                st.markdown("<div style='margin:4px 0;color:" + _sc.get(kind, "#57606a")
+                            + "'>• " + txt + "</div>", unsafe_allow_html=True)
+        else:
+            st.caption("No net-of-liabilities or margin-backed undervaluation signal "
+                       "is present at the current price.")
+        for note in xr.get("notes", []):
+            st.caption("Note: " + note)
+
     # ---- Why these methods -------------------------------------------------
     with st.expander("Why these methods - and why they have lasted"):
         for m in r["methods"]:
@@ -5291,22 +5435,31 @@ def main():
                 line_chart(s, f"{r['name']} over time", ylab),
                 use_container_width=True)
 
+    def _safe_tab(fn, *args):
+        """Never let one company's data quirk crash the whole page."""
+        try:
+            fn(*args)
+        except Exception as exc:
+            st.error("This section hit an unexpected snag on this company's data "
+                     f"and was skipped: {type(exc).__name__}: {exc}. The other tabs "
+                     "still work - please let the developer know which ticker.")
+
     # ---- Valuation --------------------------------------------------------
     with tabs[7]:
-        render_valuation(income, balance, cashflow, currency, ticker,
-                         discount, term_g, mos, asset_life, residual_pct, recovery)
+        _safe_tab(render_valuation, income, balance, cashflow, currency, ticker,
+                  discount, term_g, mos, asset_life, residual_pct, recovery)
 
     # ---- Momentum (quarterly / TTM) --------------------------------------
     with tabs[8]:
-        render_momentum(ticker, currency)
+        _safe_tab(render_momentum, ticker, currency)
 
     # ---- History (valuation bands + dividend record) ---------------------
     with tabs[9]:
-        render_history(income, balance, cashflow, currency, ticker)
+        _safe_tab(render_history, income, balance, cashflow, currency, ticker)
 
     # ---- Quality (earnings quality + liquidity) --------------------------
     with tabs[10]:
-        render_quality(income, balance, cashflow, currency, ticker)
+        _safe_tab(render_quality, income, balance, cashflow, currency, ticker)
 
 
 if __name__ == "__main__":
