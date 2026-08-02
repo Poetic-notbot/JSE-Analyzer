@@ -36,6 +36,7 @@ Run it locally with:
 """
 
 import json
+import math
 import time
 import urllib.request
 import urllib.error
@@ -56,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02a finite-life + asset-backing"
+APP_BUILD = "2026-08-02b quote-currency fix"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -1779,15 +1780,35 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     oeps = per_share(oe)
     fcfps = per_share(p.get("fcf"))
 
-    # Current price. The live traded price from the history feed is preferred, but
-    # only when it sits in a sane band around the market-cap / shares figure, which
-    # acts as an independent anchor - so a misread feed can never post a wild price.
+    # Current price. Market data (price, 52-week range, market cap) may be quoted
+    # in JMD or in the USD *reporting* currency depending on the listing - a company
+    # can report in USD yet trade in JMD (e.g. TJH), so the reporting currency does
+    # NOT tell us the quote currency. Rather than assume, pick the interpretation
+    # (as-is vs x FX) whose implied price sits at a sane multiple of book value per
+    # share. The intrinsic per-share figures are already genuine JMD, so book value
+    # per share is a reliable JMD-scale anchor.
     mcap = (ratios or {}).get("marketcap")
-    mcap_jmd = mcap * fx if _fnum(mcap) else None
-    derived_price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
-
     q_price = (quote or {}).get("price")
-    q_jmd = q_price * fx if _fnum(q_price) else None
+    anchor = bvps if (_fnum(bvps) and bvps > 0) else (
+        eps * 12.0 if (_fnum(eps) and eps > 0) else None)
+
+    def _mkt_mult(raw_ps):
+        """1.0 or fx, whichever lands raw closest (in log-distance) to the JMD
+        book-value anchor. 1.0 for JMD reporters (fx==1) or when no anchor."""
+        if abs(fx - 1.0) < 1e-9 or not (_fnum(raw_ps) and raw_ps > 0
+                                        and _fnum(anchor) and anchor > 0):
+            return 1.0
+        asis = abs(math.log(raw_ps / anchor))
+        withfx = abs(math.log(raw_ps * fx / anchor))
+        return fx if withfx < asis else 1.0
+
+    test_ps = q_price if (_fnum(q_price) and q_price > 0) else (
+        (mcap / shares) if (shares and _fnum(mcap)) else None)
+    mkt_mult = _mkt_mult(test_ps)
+
+    mcap_jmd = mcap * mkt_mult if _fnum(mcap) else None
+    derived_price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
+    q_jmd = q_price * mkt_mult if _fnum(q_price) else None
 
     price = derived_price
     price_source = "market cap / shares" if _fnum(derived_price) else None
@@ -1802,8 +1823,8 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     # Only trust the 52-week range if the quote itself passed the sanity check.
     low52 = (quote or {}).get("low52") if quote_ok else None
     high52 = (quote or {}).get("high52") if quote_ok else None
-    low52_jmd = low52 * fx if _fnum(low52) else None
-    high52_jmd = high52 * fx if _fnum(high52) else None
+    low52_jmd = low52 * mkt_mult if _fnum(low52) else None
+    high52_jmd = high52 * mkt_mult if _fnum(high52) else None
 
     roe = p.get("roe")
     g1  = _growth_estimate(p, term_g)
@@ -3226,10 +3247,13 @@ def render_valuation(income, balance, cashflow, currency, ticker,
     )
     _fxc = _FX_CONTEXT.get(ticker, {})
     if _fxc.get("reported") == "USD":
+        _psrc2 = r.get("price_source") or ""
         st.caption(
-            f"Reported in USD; converted to JMD at {_fxc.get('rate', 0):,.2f} "
-            "(live rate, 6-hour cache). The over/under-valued read is unaffected by "
-            "the exchange rate - only the JMD figures shown depend on it."
+            f"Financials reported in USD, converted to JMD at {_fxc.get('rate', 0):,.2f} "
+            "(live rate, 6-hour cache). The market price is taken in its own quote "
+            "currency (this listing may trade in JMD even though it reports in USD), "
+            "so for a JMD-traded USD reporter the fair-value comparison does depend "
+            "on the exchange rate."
         )
     st.caption(
         "Intrinsic values are derived from this company's reported statements; the "
