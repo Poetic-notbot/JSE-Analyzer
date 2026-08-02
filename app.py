@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02k portfolio + report"
+APP_BUILD = "2026-08-02l ratios-history bands"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -429,6 +429,62 @@ def _load_ratios(ticker):
         "roicSite":      first("roic"),
         "currentRatio":  first("currentratio"),
     }
+
+
+def get_ratios_history(ticker):
+    """Per-year P/E, P/B and dividend yield straight from the ratios feed's own
+    history arrays (more reliable than reconstructing them from prices). Cached 6h.
+    Returns {'pe':{year:val}, 'pb':{year:val}, 'yield':{year:val}} or {}."""
+    return _memo(("rhist", ticker), lambda: _load_ratios_history(ticker),
+                 lambda r: bool(r and (r.get("pe") or r.get("pb") or r.get("yield"))))
+
+
+def _load_ratios_history(ticker):
+    url = f"{BASE}/quote/{_exchange_of(ticker)}/{ticker}/financials/ratios/__data.json"
+    raw = _fetch(url)
+    if raw is None:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    node = None
+    for n in obj.get("nodes", []):
+        if isinstance(n, dict) and isinstance(n.get("data"), list):
+            rr = _resolve(n["data"])
+            if isinstance(rr, dict) and "marketcap" in rr and "evebit" in rr:
+                node = rr
+                break
+    if node is None:
+        return {}
+    labels = node.get("fiscalYear") or node.get("datekey") or []
+    if not isinstance(labels, list) or not labels:
+        return {}
+
+    def arr(*keys):
+        for k in keys:
+            v = node.get(k)
+            if isinstance(v, list):
+                return v
+        return []
+
+    pe, pb = arr("pe"), arr("pb", "pbRatio")
+    dy = arr("dividendyield", "dividendYield")
+    out = {"pe": {}, "pb": {}, "yield": {}}
+    for i, lab in enumerate(labels):
+        if str(lab).upper() == "TTM":
+            continue
+        try:
+            yr = int(str(lab)[:4])
+        except Exception:
+            continue
+        if i < len(pe) and _fnum(pe[i]) and pe[i] > 0:
+            out["pe"][yr] = float(pe[i])
+        if i < len(pb) and _fnum(pb[i]) and pb[i] > 0:
+            out["pb"][yr] = float(pb[i])
+        if i < len(dy) and _fnum(dy[i]) and dy[i] > 0:
+            out["yield"][yr] = float(dy[i])
+    return out
 
 
 # Candidate key names the price-history feed might use for the date and the
@@ -2311,57 +2367,53 @@ def _pctile(cur, vals):
     return sum(1 for v in xs if v <= cur) / len(xs)
 
 
-def valuation_history(income, balance, cashflow, price_series, fx,
+def valuation_history(rhist, income, balance, cashflow, price_series, fx,
                       cur_price, cur_eps, cur_bvps, cur_dps):
     """Per-year P/E, P/B and dividend yield versus today, so a stock can be judged
-    against its OWN valuation history. Returns {} if the pieces aren't there."""
-    if not price_series or len(price_series) < 40:
-        return {}
-    # One currency multiplier for every historical close (the listing currency
-    # doesn't change): infer 1 vs fx from where today's price sits.
-    raw_last = price_series[-1][1]
-    mult = 1.0
-    if _fnum(cur_price) and _fnum(raw_last) and raw_last > 0:
-        mult = fx if (cur_price / raw_last) > 10 else 1.0
+    against its OWN valuation history. Prefers the ratios feed's own history arrays
+    (`rhist`); falls back to reconstructing them from year-end prices. Returns {}."""
+    pe = dict((rhist or {}).get("pe") or {})
+    pb = dict((rhist or {}).get("pb") or {})
+    dy = dict((rhist or {}).get("yield") or {})
 
-    ni  = _row_by_year(income, "Net Income to Common", "Net Income")
-    eq  = _row_by_year(balance, "Total Common Equity", "Shareholders' Equity")
-    dvd = _row_by_year(cashflow, "Common Dividends Paid")
-    shy = (_row_by_year(income, "Shares Outstanding (Basic)", "Basic Shares Outstanding")
-           or _row_by_year(balance, "Total Common Shares Outstanding"))
-    years = sorted(y for y in ni if y in shy and shy[y] > 0)
-
-    pe, pb, dy = {}, {}, {}
-    for y in years:
-        px = _price_in_year(price_series, y, mult)
-        if not _fnum(px) or px <= 0:
-            continue
-        sh = shy[y]
-        eps_y = ni[y] / sh
-        if eps_y > 0:
-            pe[y] = px / eps_y
-        if y in eq and eq[y] > 0:
-            pb[y] = px / (eq[y] / sh)
-        if y in dvd and dvd[y]:
-            dy[y] = (abs(dvd[y]) / sh) / px
+    # Fallback: reconstruct from prices only if the ratios history is thin.
+    if len(pe) < 3 and price_series and len(price_series) >= 40:
+        raw_last = price_series[-1][1]
+        mult = fx if (_fnum(cur_price) and _fnum(raw_last) and raw_last > 0
+                      and cur_price / raw_last > 10) else 1.0
+        ni  = _row_by_year(income, "Net Income to Common", "Net Income")
+        eq  = _row_by_year(balance, "Total Common Equity", "Shareholders' Equity")
+        dvd = _row_by_year(cashflow, "Common Dividends Paid")
+        shy = (_row_by_year(income, "Shares Outstanding (Basic)", "Basic Shares Outstanding")
+               or _row_by_year(balance, "Total Common Shares Outstanding"))
+        for y in sorted(y for y in ni if y in shy and shy[y] > 0):
+            px = _price_in_year(price_series, y, mult)
+            if not _fnum(px) or px <= 0:
+                continue
+            sh = shy[y]
+            if ni[y] / sh > 0:
+                pe[y] = px / (ni[y] / sh)
+            if y in eq and eq[y] > 0:
+                pb[y] = px / (eq[y] / sh)
+            if y in dvd and dvd[y]:
+                dy[y] = (abs(dvd[y]) / sh) / px
 
     def stat(hist, cur, higher_is_cheaper=False):
         vals = list(hist.values())
         if len(vals) < 3 or not _fnum(cur):
             return None
-        med = _median(vals)
         p = _pctile(cur, vals)
         if higher_is_cheaper and p is not None:
-            p = 1 - p              # for yield, a high value = cheap
-        return {"current": cur, "median": med, "low": min(vals), "high": max(vals),
-                "cheap_pctile": p, "series": hist, "n": len(vals)}
+            p = 1 - p
+        return {"current": cur, "median": _median(vals), "low": min(vals),
+                "high": max(vals), "cheap_pctile": p, "series": hist, "n": len(vals)}
 
-    cur_yield = (cur_dps / cur_price) if (_fnum(cur_dps) and _fnum(cur_price) and cur_price > 0) else None
+    cur_yield = _safe_div(cur_dps, cur_price) if (_fnum(cur_dps) and _fnum(cur_price)
+                                                  and cur_price > 0) else None
     return {
-        "pe": stat(pe, cur_eps and cur_price and _safe_div(cur_price, cur_eps)),
-        "pb": stat(pb, cur_bvps and cur_price and _safe_div(cur_price, cur_bvps)),
+        "pe": stat(pe, _safe_div(cur_price, cur_eps) if (_fnum(cur_eps) and cur_eps > 0) else None),
+        "pb": stat(pb, _safe_div(cur_price, cur_bvps) if (_fnum(cur_bvps) and cur_bvps > 0) else None),
         "yield": stat(dy, cur_yield, higher_is_cheaper=True),
-        "mult": mult,
     }
 
 
@@ -3718,8 +3770,9 @@ def render_history(income, balance, cashflow, currency, ticker):
     r = intrinsic_valuation(inc_a, bal_a, cf_a, p, get_ratios(ticker), ctype,
                             0.12, 0.02, currency, ticker, 0.25, quote=get_price(ticker))
     fx = (_FX_CONTEXT.get(ticker, {}) or {}).get("rate") or 1.0
+    rhist = get_ratios_history(ticker)
     series = get_price_history(ticker)
-    vh = valuation_history(inc_a, bal_a, cf_a, series, fx, r.get("price"),
+    vh = valuation_history(rhist, inc_a, bal_a, cf_a, series, fx, r.get("price"),
                            r.get("eps"), r.get("bvps"), r.get("dps"))
     cur = currency or "JMD"
 
@@ -3756,10 +3809,9 @@ def render_history(income, balance, cashflow, currency, ticker):
             s.index = [str(y) for y in s.index]
             st.plotly_chart(line_chart(s, "P/E by year", "P/E"),
                             use_container_width=True)
-        st.caption(f"Multiples are each year-end price against that year's reported "
-                   f"figures ({vh.get('pe', {}).get('n', '?')} years). Companies with "
-                   "a non-December year-end are matched to the calendar year, so "
-                   "treat the bands as indicative.")
+        st.caption(f"Historical multiples come from the data source's own ratios "
+                   f"history ({vh.get('pe', {}).get('n', '?')} years); today's figure "
+                   "uses the live price against the latest reported per-share values.")
 
     st.divider()
     st.markdown("#### Dividend track record")
