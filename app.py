@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02c implied-growth + value labels"
+APP_BUILD = "2026-08-02d dividends + exch fallback"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -66,6 +66,33 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124 Safari/537.36"
     )
 }
+
+# Exchanges to try, in order. Most names live under jmse (Jamaica), but some JSE
+# listings are cross-listed and carried on the source under their PRIMARY market -
+# e.g. Guardian Holdings (GHL) is a Trinidad name (ttse). We try jmse first, then
+# ttse, and remember whichever returned data so the other feeds use the same one.
+_EXCHANGES = ["jmse", "ttse"]
+_TICKER_EXCHANGE = {}
+_EXCHANGE_OVERRIDE = {"GHL": "ttse"}          # known cross-listings (try this first)
+
+
+def _exchanges_for(ticker):
+    # Conservative: unknown tickers try ONLY jmse, so a JSE name that is simply not
+    # covered never accidentally loads a different company that shares the ticker on
+    # another exchange. Cross-listings are handled by the explicit override map.
+    t = ticker.upper()
+    if t in _TICKER_EXCHANGE:
+        return [_TICKER_EXCHANGE[t]]
+    if t in _EXCHANGE_OVERRIDE:
+        pref = _EXCHANGE_OVERRIDE[t]
+        return [pref, "jmse"] if pref != "jmse" else ["jmse"]
+    return ["jmse"]
+
+
+def _exchange_of(ticker):
+    """The exchange segment that last worked for this ticker (jmse by default)."""
+    return _TICKER_EXCHANGE.get(ticker.upper(),
+                                _EXCHANGE_OVERRIDE.get(ticker.upper(), "jmse"))
 
 # Each financial statement and the URL segment it lives under. The income
 # statement used to live at the bare /financials/ path; the site has since moved
@@ -234,15 +261,17 @@ def _load_statement(ticker, statement):
     Returns (None, None, None) if the statement could not be loaded.
     """
     attempts = []
-    for seg in _statement_segments(statement):
-        url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
-        raw = _fetch(url)
-        result = _parse_statement(raw, ticker)
-        attempts.append((url, "no response" if raw is None else
-                         ("parsed OK" if result[0] is not None else "no data in page")))
-        if result[0] is not None:
-            _STMT_ATTEMPTS[(ticker, statement)] = attempts
-            return result
+    for exch in _exchanges_for(ticker):
+        for seg in _statement_segments(statement):
+            url = f"{BASE}/quote/{exch}/{ticker}/financials/{seg}__data.json"
+            raw = _fetch(url)
+            result = _parse_statement(raw, ticker)
+            attempts.append((url, "no response" if raw is None else
+                             ("parsed OK" if result[0] is not None else "no data in page")))
+            if result[0] is not None:
+                _TICKER_EXCHANGE[ticker.upper()] = exch   # reuse for the other feeds
+                _STMT_ATTEMPTS[(ticker, statement)] = attempts
+                return result
     _STMT_ATTEMPTS[(ticker, statement)] = attempts
     return None, None, None
 
@@ -334,7 +363,7 @@ def _load_ratios(ticker):
     """Current (TTM) valuation ratios from stockanalysis.com's ratios feed.
     Index 0 of each per-period array is the TTM/most-recent column.
     Returns {} on any failure (callers must degrade gracefully)."""
-    url = f"{BASE}/quote/jmse/{ticker}/financials/ratios/__data.json"
+    url = f"{BASE}/quote/{_exchange_of(ticker)}/{ticker}/financials/ratios/__data.json"
     raw = _fetch(url)
     if raw is None:
         return {}
@@ -452,17 +481,55 @@ def _find_price_series(node):
 
 
 def get_price(ticker):
-    """Cached wrapper: keeps a good price 6h, retries an empty result after ~2min."""
-    return _memo(("price", ticker), lambda: _load_price(ticker), lambda r: bool(r))
+    """Cached wrapper: keeps a good price 1h (kept fresh through the day), retries
+    an empty result after ~2min."""
+    return _memo(("price", ticker), lambda: _load_price(ticker), lambda r: bool(r),
+                 ttl_ok=60 * 60)
+
+
+_PRICE_KEYS = ("price", "last", "close", "c", "cl", "regularMarketPrice",
+               "lastPrice", "priceClose", "p")
+
+
+def _find_scalar_price(node, ref):
+    """Best-effort: pull a single 'current price' scalar out of a resolved payload,
+    accepting it only if it is within a tight band of the series' last close `ref`
+    (so we never grab an unrelated number). Returns a float or None."""
+    if not (_fnum(ref) and ref > 0):
+        return None
+    best = [None]
+
+    def ok(v):
+        return _fnum(v) and 0.7 * ref <= v <= 1.5 * ref
+
+    def walk(x):
+        if best[0] is not None:
+            return
+        if isinstance(x, dict):
+            for k in _PRICE_KEYS:
+                if k in x and ok(x[k]):
+                    best[0] = float(x[k])
+                    return
+            for v in x.values():
+                walk(v)
+                if best[0] is not None:
+                    return
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+                if best[0] is not None:
+                    return
+
+    walk(node)
+    return best[0]
 
 
 def _load_price(ticker):
-    """Latest traded price and a 52-week range from the site's price-history feed
-    (https://stockanalysis.com/quote/jmse/<T>/history/). Returns
-        {"price", "date", "low52", "high52", "currency"}   or {} on failure.
-    `currency` is the raw quote currency BEFORE any JMD conversion (USD for the
-    USD reporters, JMD otherwise). Callers convert with the shared FX rate."""
-    url = f"{BASE}/quote/jmse/{ticker}/history/__data.json"
+    """Latest traded price and a 52-week range from the site's price-history feed.
+    Returns {"price", "date", "low52", "high52", "currency"} or {} on failure.
+    `currency` is the raw quote currency BEFORE any JMD conversion. The price is a
+    delayed last close, so callers should label it as such."""
+    url = f"{BASE}/quote/{_exchange_of(ticker)}/{ticker}/history/__data.json"
     raw = _fetch(url)
     if raw is None:
         return {}
@@ -470,21 +537,29 @@ def _load_price(ticker):
         obj = json.loads(raw)
     except Exception:
         return {}
-    series = None
+    series, resolved_nodes = None, []
     for n in obj.get("nodes", []):
         if isinstance(n, dict) and isinstance(n.get("data"), list):
-            series = _find_price_series(_resolve(n["data"]))
-            if series:
-                break
+            res = _resolve(n["data"])
+            resolved_nodes.append(res)
+            if series is None:
+                series = _find_price_series(res)
     if not series:
         return {}
     last_date, last_close = series[-1]
+    # A feed may carry a fresher 'current price' scalar than the last daily row.
+    scalar = None
+    for res in resolved_nodes:
+        scalar = _find_scalar_price(res, last_close)
+        if scalar is not None:
+            break
+    price = scalar if scalar is not None else last_close
     window = [c for _, c in series][-252:]          # ~ one trading year
     return {
-        "price": last_close,
+        "price": price,
         "date": last_date,
-        "low52": min(window) if window else None,
-        "high52": max(window) if window else None,
+        "low52": min(window + [price]) if window else price,
+        "high52": max(window + [price]) if window else price,
         "currency": "USD" if ticker.upper() in USD_REPORTERS else "JMD",
     }
 
@@ -2052,6 +2127,8 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     verdict, band = _valuation_verdict(price, central, buy_below)
 
     backing = asset_backing(balance, p, shares, recovery)
+    dividend = _dividend_safety(dps, price, p)
+    expret = _expected_return(price, central, dividend.get("yield"))
 
     return {
         "fx": fx, "shares": shares, "currency": currency,
@@ -2065,7 +2142,54 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
         "central": central, "low": low, "high": high, "buy_below": buy_below,
         "mos": mos, "upside": upside, "verdict": verdict, "band": band,
         "ncav": ncav, "graham_n": graham_n, "backing": backing, "ctype": ctype,
+        "dividend": dividend, "expret": expret, "dqFlags": _data_flags(p),
     }
+
+
+def _dividend_safety(dps, price, p):
+    """Yield, payout ratios (of earnings AND of free cash flow) and a plain-language
+    coverage verdict. Empty dict when the company pays no dividend."""
+    if not (_fnum(dps) and dps > 0):
+        return {}
+    d = {"dps": dps}
+    d["yield"] = (dps / price) if (_fnum(price) and price > 0) else None
+    d["payoutNi"] = p.get("divToNi")
+    d["payoutFcf"] = p.get("divToFcf")
+    ni, fcf = d["payoutNi"], d["payoutFcf"]
+    if _fnum(ni) and ni > 1.0:
+        d["safety"] = ("bad", "The dividend is bigger than net income - it is being "
+                       "funded from reserves or borrowing, not current profit.")
+    elif _fnum(fcf) and fcf > 1.0:
+        d["safety"] = ("caution", "Covered by earnings but not by free cash flow - "
+                       "vulnerable to a trim if cash gets tight.")
+    elif _fnum(ni) and ni <= 0.85 and (not _fnum(fcf) or fcf <= 0.9):
+        d["safety"] = ("good", "Comfortably covered by both earnings and free cash flow.")
+    else:
+        d["safety"] = ("caution", "Coverage is adequate but not generous - a downturn "
+                       "would squeeze it.")
+    return d
+
+
+def _expected_return(price, central, div_yield):
+    """A rough expected annualised return if the price converges to the central
+    fair value over five years, plus the dividend collected along the way."""
+    if not (_fnum(price) and price > 0 and _fnum(central) and central > 0):
+        return {}
+    rerate = (central / price) ** (1 / 5.0) - 1.0
+    dy = div_yield if _fnum(div_yield) else 0.0
+    return {"rerate": rerate, "divYield": dy, "annual5y": rerate + dy}
+
+
+def _data_flags(p):
+    """Reasons to trust the valuation less, for a plain-language reliability note."""
+    flags = list(p.get("dqFlags") or [])
+    if p.get("ipoDistorted") or (p.get("totalYears") or 0) < 4:
+        flags.append("short or IPO-distorted history (less than ~4 clean years)")
+    if p.get("recentCollapse"):
+        flags.append("earnings swung from profit to loss in the latest year")
+    if p.get("structurallyWeak"):
+        flags.append("losses in most years on record")
+    return flags
 
 
 def _pct(x):
@@ -3177,6 +3301,39 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                 f"52-week price range: {money(r['low52'])} to {money(r['high52'])}"
                 f"{pos}."
             )
+
+    # ---- Expected return + dividend safety --------------------------------
+    ex = r.get("expret") or {}
+    dv = r.get("dividend") or {}
+    if ex or dv:
+        ec = st.columns(3)
+        if ex.get("annual5y") is not None:
+            ec[0].metric("Expected return (~5 yr)", f"{ex['annual5y']*100:+.0f}%/yr",
+                         help="Rough annualised return if the price drifts to the "
+                              "central fair value over five years, plus the dividend "
+                              "yield collected along the way. Not a forecast.")
+        if dv.get("yield") is not None:
+            ec[1].metric("Dividend yield", f"{dv['yield']*100:.1f}%")
+        if _fnum(dv.get("payoutNi")):
+            ec[2].metric("Payout of earnings", f"{dv['payoutNi']*100:.0f}%",
+                         help="Dividends as a share of net income. Under ~70-80% is "
+                              "usually comfortable.")
+        if dv.get("safety"):
+            kind, txt = dv["safety"]
+            col = {"good": "#1a7f37", "caution": "#9a6700",
+                   "bad": "#cf222e"}.get(kind, "#57606a")
+            fcf_txt = (f" Payout of free cash flow: {dv['payoutFcf']*100:.0f}%."
+                       if _fnum(dv.get("payoutFcf")) else "")
+            st.markdown("<div style='margin:2px 0;color:" + col + "'><b>Dividend "
+                        "safety:</b> " + txt + fcf_txt + "</div>",
+                        unsafe_allow_html=True)
+
+    # ---- Reliability / data-trust note ------------------------------------
+    _flags = r.get("dqFlags") or []
+    if _flags:
+        st.warning("**Read this valuation with extra caution** - " + "; ".join(_flags)
+                   + ". The methods still run, but a fair value built on unusual or "
+                   "short data is less dependable.")
 
     st.divider()
 
