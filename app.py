@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02m ratios bands (labelless)"
+APP_BUILD = "2026-08-02n ratios rows parser"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -440,7 +440,11 @@ def get_ratios_history(ticker):
                                           for k in ("pe", "pb", "yield"))))
 
 
-def _load_ratios_history(ticker):
+def _ratios_rows(ticker):
+    """The ratios page as {labels:[...], rows:{title:[values]}, flat:bool}. The site
+    now serves it as a normal statement (rows like 'PE Ratio' keyed by title in a
+    'financialData' node); older/other layouts stored the values flat on the node
+    (node['pe'] = array). Handle both. NO FX is applied - ratios are dimensionless."""
     url = f"{BASE}/quote/{_exchange_of(ticker)}/{ticker}/financials/ratios/__data.json"
     raw = _fetch(url)
     if raw is None:
@@ -449,48 +453,90 @@ def _load_ratios_history(ticker):
         obj = json.loads(raw)
     except Exception:
         return {}
-    node = None
     for n in obj.get("nodes", []):
-        if isinstance(n, dict) and isinstance(n.get("data"), list):
-            rr = _resolve(n["data"])
-            if isinstance(rr, dict) and "marketcap" in rr and "evebit" in rr:
-                node = rr
-                break
-    if node is None:
+        if not (isinstance(n, dict) and isinstance(n.get("data"), list)):
+            continue
+        rr = _resolve(n["data"])
+        if not isinstance(rr, dict):
+            continue
+        fd = rr.get("financialData")
+        if isinstance(fd, dict):                       # statement-style (current site)
+            labels = fd.get("fiscalYear") or fd.get("datekey") or []
+            rows = {}
+            for entry in (rr.get("map") or []):
+                mid, title = entry.get("id"), entry.get("title")
+                if mid and title and isinstance(fd.get(mid), list):
+                    rows[title] = fd[mid]
+            if rows:
+                return {"labels": labels if isinstance(labels, list) else [],
+                        "rows": rows, "flat": False}
+        if "marketcap" in rr and "evebit" in rr:       # legacy flat layout
+            labels = rr.get("fiscalYear") or rr.get("datekey") or []
+            return {"labels": labels if isinstance(labels, list) else [],
+                    "rows": rr, "flat": True}
+    return {}
+
+
+def _ratio_row(full, *titles):
+    """A metric's raw value array, matched by exact key (flat) or by title contains
+    (statement-style, case-insensitive)."""
+    rows, flat = full.get("rows") or {}, full.get("flat")
+    for t in titles:
+        v = rows.get(t)
+        if isinstance(v, list):
+            return v
+    if not flat:
+        for t in titles:
+            for title, arr in rows.items():
+                if isinstance(arr, list) and t.lower() in str(title).lower():
+                    return arr
+    return []
+
+
+def _ratio_series(full, *titles):
+    """(by_year{yr:val}, vals[historical], current) for one metric. The TTM/Current
+    column becomes `current`; year-labelled columns become the historical band."""
+    labels = full.get("labels") or []
+    arr = _ratio_row(full, *titles)
+    by_year, vals, current = {}, [], None
+    for i, v in enumerate(arr):
+        if not _fnum(v):
+            continue
+        v = float(v)
+        lab = str(labels[i]).upper() if i < len(labels) else ""
+        if lab in ("TTM", "CURRENT") or (not labels and i == 0):
+            if current is None:
+                current = v
+            continue
+        vals.append(v)
+        if i < len(labels):
+            try:
+                by_year[int(str(labels[i])[:4])] = v
+            except Exception:
+                pass
+    return by_year, vals, current
+
+
+def _load_ratios_history(ticker):
+    full = _ratios_rows(ticker)
+    if not full or not full.get("rows"):
         return {}
-    labels = node.get("fiscalYear") or node.get("datekey") or []
-    labels = labels if isinstance(labels, list) else []
 
-    def arr(*keys):
-        for k in keys:
-            v = node.get(k)
-            if isinstance(v, list):
-                return v
-        return []
-
-    def build(vals):
-        """A metric array -> {'vals': [historical values], 'byYear': {yr: val}}.
-        Index 0 is the TTM/current column, excluded from the historical band. Year
-        labels are used only for the chart and are optional - the band stats work
-        from the values alone."""
-        out_vals, by_year = [], {}
-        for i, v in enumerate(vals):
-            is_ttm = (str(labels[i]).upper() == "TTM") if i < len(labels) else (i == 0)
-            if is_ttm:
-                continue
-            if _fnum(v) and v > 0:
-                out_vals.append(float(v))
-                if i < len(labels):
-                    try:
-                        by_year[int(str(labels[i])[:4])] = float(v)
-                    except Exception:
-                        pass
-        return {"vals": out_vals, "byYear": by_year}
+    def band(titles, is_yield=False):
+        by_year, vals, _cur = _ratio_series(full, *titles)
+        vals = [v for v in vals if v > 0]
+        by_year = {k: v for k, v in by_year.items() if v > 0}
+        if is_yield:                                   # percent -> fraction if needed
+            allv = vals + list(by_year.values())
+            if allv and _median([abs(x) for x in allv]) > 0.5:
+                vals = [v / 100 for v in vals]
+                by_year = {k: v / 100 for k, v in by_year.items()}
+        return {"vals": vals, "byYear": by_year}
 
     return {
-        "pe": build(arr("pe", "peRatio")),
-        "pb": build(arr("pb", "pbRatio")),
-        "yield": build(arr("dividendyield", "dividendYield")),
+        "pe":    band(["pe", "peRatio", "PE Ratio", "P/E Ratio", "PE"]),
+        "pb":    band(["pb", "pbRatio", "PB Ratio", "P/B Ratio", "PB"]),
+        "yield": band(["dividendyield", "dividendYield", "Dividend Yield"], is_yield=True),
     }
 
 
