@@ -53,6 +53,11 @@ import streamlit as st
 # a flat array (and -1 means "missing"). resolve() below turns it back into
 # ordinary nested data.
 
+# Bump this whenever the data-fetching behaviour changes. It is shown in the
+# sidebar so it is unambiguous which build is actually running (a reboot that
+# doesn't change this string means the deployment is not on the latest commit).
+APP_BUILD = "2026-08-01e income-statement-path"
+
 BASE = "https://stockanalysis.com"
 HEADERS = {
     "User-Agent": (
@@ -61,9 +66,12 @@ HEADERS = {
     )
 }
 
-# Each financial statement and the URL segment it lives under.
+# Each financial statement and the URL segment it lives under. The income
+# statement used to live at the bare /financials/ path; the site has since moved
+# it to the named /financials/income-statement/ path (matching the others), so
+# the old empty segment now 404s for every ticker.
 STATEMENTS = {
-    "Income Statement": "",                       # /financials/
+    "Income Statement": "income-statement/",      # /financials/income-statement/
     "Balance Sheet": "balance-sheet/",            # /financials/balance-sheet/
     "Cash Flow": "cash-flow-statement/",          # /financials/cash-flow-statement/
     "Ratios": "ratios/",                          # /financials/ratios/
@@ -125,8 +133,33 @@ def _apply_fx(ticker, df, aggregates, currency):
 
 
 
+# Process-wide cache that keeps GOOD fetch results for a long time but remembers
+# FAILURES only briefly - so a transient block on stockanalysis.com clears on its
+# own within a couple of minutes, instead of a 6-hour st.cache_data entry locking
+# a ticker out long after the source has recovered.
+_FETCH_MEMO = {}
+
+# Records, per (ticker, statement), the URLs the loader actually tried and how
+# each turned out - surfaced in the UI when a statement fails to load, so it is
+# obvious which path the running code used (and therefore which build is live).
+_STMT_ATTEMPTS = {}
+
+
+def _memo(key, producer, is_ok, ttl_ok=60 * 60 * 6, ttl_bad=120):
+    now = time.time()
+    hit = _FETCH_MEMO.get(key)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    value = producer()
+    _FETCH_MEMO[key] = (now + (ttl_ok if is_ok(value) else ttl_bad), value)
+    return value
+
+
 def _fetch(url, retries=4, delay=1.4):
-    """Download a URL's text, retrying politely on transient failures."""
+    """Download a URL's text, retrying politely on transient failures. A 404 is a
+    definitive 'not covered' and returns immediately; other errors get a short,
+    escalating backoff. Deliberately gentle - hammering a throttling source only
+    deepens the throttle."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
@@ -170,8 +203,24 @@ def _resolve(flat):
     return walk(0)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_statement(ticker, statement):
+    """Cached wrapper: keeps a good statement 6h, retries a failed one after ~2min."""
+    return _memo(("stmt", ticker, statement),
+                 lambda: _load_statement(ticker, statement),
+                 lambda r: r is not None and r[0] is not None)
+
+
+def _statement_segments(statement):
+    """URL segment(s) to try for a statement, in order. The income statement is
+    served at BOTH the bare /financials/ path (historically) and the named
+    /financials/income-statement/ path; the site has flipped between them, so we
+    try both and use whichever actually parses. The others have one stable path."""
+    if statement == "Income Statement":
+        return ["income-statement/", ""]
+    return [STATEMENTS[statement]]
+
+
+def _load_statement(ticker, statement):
     """
     Return one financial statement for a ticker as a tidy table.
 
@@ -183,9 +232,23 @@ def get_statement(ticker, statement):
       * currency  : "JMD" or "USD" as reported.
     Returns (None, None, None) if the statement could not be loaded.
     """
-    seg = STATEMENTS[statement]
-    url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
-    raw = _fetch(url)
+    attempts = []
+    for seg in _statement_segments(statement):
+        url = f"{BASE}/quote/jmse/{ticker}/financials/{seg}__data.json"
+        raw = _fetch(url)
+        result = _parse_statement(raw, ticker)
+        attempts.append((url, "no response" if raw is None else
+                         ("parsed OK" if result[0] is not None else "no data in page")))
+        if result[0] is not None:
+            _STMT_ATTEMPTS[(ticker, statement)] = attempts
+            return result
+    _STMT_ATTEMPTS[(ticker, statement)] = attempts
+    return None, None, None
+
+
+def _parse_statement(raw, ticker):
+    """Turn one statement's raw __data.json text into (df, aggregates, currency),
+    or (None, None, None) if it is missing/unparseable/empty."""
     if raw is None:
         return None, None, None
     try:
@@ -261,8 +324,12 @@ def get_statement(ticker, statement):
     return _apply_fx(ticker, df, aggregates, currency)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def get_ratios(ticker):
+    """Cached wrapper: keeps good ratios 6h, retries an empty result after ~2min."""
+    return _memo(("ratios", ticker), lambda: _load_ratios(ticker), lambda r: bool(r))
+
+
+def _load_ratios(ticker):
     """Current (TTM) valuation ratios from stockanalysis.com's ratios feed.
     Index 0 of each per-period array is the TTM/most-recent column.
     Returns {} on any failure (callers must degrade gracefully)."""
@@ -302,6 +369,122 @@ def get_ratios(ticker):
         "dividendYield": first("dividendyield"),
         "roicSite":      first("roic"),
         "currentRatio":  first("currentratio"),
+    }
+
+
+# Candidate key names the price-history feed might use for the date and the
+# closing price. The feed is a SvelteKit "__data.json" like the statements, but
+# its exact field names are not documented, so we accept any of these.
+_DATE_KEYS  = ("t", "d", "date", "datekey", "timestamp", "dateFormatted", "dt")
+_CLOSE_KEYS = ("c", "close", "Close", "adjClose", "adjclose", "adj_close", "a", "cl")
+
+
+def _find_price_series(node):
+    """Best-effort: dig an ascending [(date, close), ...] series out of a resolved
+    price-history payload, tolerant of the exact shape/keys the feed uses. Handles
+    both row-of-objects and columnar (parallel-array) layouts. Returns None if no
+    plausible series is found, so callers fall back to other price sources."""
+
+    def rows_to_series(rows):
+        ck = None
+        for k in _CLOSE_KEYS:
+            if any(isinstance(r, dict) and k in r for r in rows):
+                ck = k
+                break
+        if ck is None:
+            return None
+        dk = next((k for k in _DATE_KEYS
+                   if any(isinstance(r, dict) and k in r for r in rows)), None)
+        out = []
+        for r in rows:
+            if isinstance(r, dict) and _fnum(r.get(ck)):
+                out.append((r.get(dk) if dk else None, float(r[ck])))
+        return out if len(out) >= 2 else None
+
+    def columnar(d):
+        ck = next((k for k in _CLOSE_KEYS if isinstance(d.get(k), list)), None)
+        if not ck:
+            return None
+        closes = d[ck]
+        if sum(1 for x in closes if _fnum(x)) < 2:
+            return None
+        dk = next((k for k in _DATE_KEYS
+                   if isinstance(d.get(k), list) and len(d[k]) == len(closes)), None)
+        dates = d[dk] if dk else [None] * len(closes)
+        return [(dt, float(c)) for dt, c in zip(dates, closes) if _fnum(c)]
+
+    best = None
+
+    def walk(x):
+        nonlocal best
+        if best is not None:
+            return
+        if isinstance(x, list):
+            if x and any(isinstance(e, dict) for e in x):
+                s = rows_to_series(x)
+                if s:
+                    best = s
+                    return
+            for e in x:
+                walk(e)
+                if best is not None:
+                    return
+        elif isinstance(x, dict):
+            s = columnar(x)
+            if s:
+                best = s
+                return
+            for v in x.values():
+                walk(v)
+                if best is not None:
+                    return
+
+    walk(node)
+    if not best:
+        return None
+    # Normalise to ascending (oldest -> newest). If dates are present and the
+    # first is later than the last, the feed is newest-first, so reverse it.
+    dated = [t for t in best if t[0] is not None]
+    if len(dated) >= 2 and str(dated[0][0]) > str(dated[-1][0]):
+        best = list(reversed(best))
+    return best
+
+
+def get_price(ticker):
+    """Cached wrapper: keeps a good price 6h, retries an empty result after ~2min."""
+    return _memo(("price", ticker), lambda: _load_price(ticker), lambda r: bool(r))
+
+
+def _load_price(ticker):
+    """Latest traded price and a 52-week range from the site's price-history feed
+    (https://stockanalysis.com/quote/jmse/<T>/history/). Returns
+        {"price", "date", "low52", "high52", "currency"}   or {} on failure.
+    `currency` is the raw quote currency BEFORE any JMD conversion (USD for the
+    USD reporters, JMD otherwise). Callers convert with the shared FX rate."""
+    url = f"{BASE}/quote/jmse/{ticker}/history/__data.json"
+    raw = _fetch(url)
+    if raw is None:
+        return {}
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+    series = None
+    for n in obj.get("nodes", []):
+        if isinstance(n, dict) and isinstance(n.get("data"), list):
+            series = _find_price_series(_resolve(n["data"]))
+            if series:
+                break
+    if not series:
+        return {}
+    last_date, last_close = series[-1]
+    window = [c for _, c in series][-252:]          # ~ one trading year
+    return {
+        "price": last_close,
+        "date": last_date,
+        "low52": min(window) if window else None,
+        "high52": max(window) if window else None,
+        "currency": "USD" if ticker.upper() in USD_REPORTERS else "JMD",
     }
 
 
@@ -1372,8 +1555,18 @@ def value_profile(p, ratios):
 #     target: current assets minus ALL liabilities, per share.
 
 def _fnum(x):
-    """True only for a real, finite number (rejects None, bool, NaN)."""
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x
+    """True only for a real, finite number. Accepts both Python and NumPy numeric
+    scalars - pandas frequently yields numpy int64/float64, and an earlier
+    isinstance(x, (int, float)) check silently rejected numpy int64, which blanked
+    per-share figures for whole-number rows like share counts. Rejects None, bool,
+    strings, NaN and infinities."""
+    if isinstance(x, bool):
+        return False
+    try:
+        xf = float(x)
+    except (TypeError, ValueError):
+        return False
+    return xf == xf and xf not in (float("inf"), float("-inf"))
 
 
 def _clamp(x, lo, hi):
@@ -1464,7 +1657,7 @@ def _perpetual_growth(g_sust, term_g, discount):
 
 
 def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
-                        discount, term_g, currency, ticker, mos=0.25):
+                        discount, term_g, currency, ticker, mos=0.25, quote=None):
     """Build a fair value from several long-standing methods, blend the ones that
     suit this kind of business into a central estimate with a range, and compare
     it to the live market price. All per-share figures are returned in JMD.
@@ -1508,9 +1701,31 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     oeps = per_share(oe)
     fcfps = per_share(p.get("fcf"))
 
+    # Current price. The live traded price from the history feed is preferred, but
+    # only when it sits in a sane band around the market-cap / shares figure, which
+    # acts as an independent anchor - so a misread feed can never post a wild price.
     mcap = (ratios or {}).get("marketcap")
     mcap_jmd = mcap * fx if _fnum(mcap) else None
-    price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
+    derived_price = (mcap_jmd / shares) if (shares and _fnum(mcap_jmd)) else None
+
+    q_price = (quote or {}).get("price")
+    q_jmd = q_price * fx if _fnum(q_price) else None
+
+    price = derived_price
+    price_source = "market cap / shares" if _fnum(derived_price) else None
+    price_date = None
+    quote_ok = False
+    if _fnum(q_jmd) and (derived_price is None or 0.3 <= q_jmd / derived_price <= 3.0):
+        price = q_jmd
+        price_source = "latest close (price history)"
+        price_date = (quote or {}).get("date")
+        quote_ok = True
+
+    # Only trust the 52-week range if the quote itself passed the sanity check.
+    low52 = (quote or {}).get("low52") if quote_ok else None
+    high52 = (quote or {}).get("high52") if quote_ok else None
+    low52_jmd = low52 * fx if _fnum(low52) else None
+    high52_jmd = high52 * fx if _fnum(high52) else None
 
     roe = p.get("roe")
     g1  = _growth_estimate(p, term_g)
@@ -1669,7 +1884,9 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
 
     return {
         "fx": fx, "shares": shares, "currency": currency,
-        "price": price, "eps": eps, "bvps": bvps, "dps": dps,
+        "price": price, "price_source": price_source, "price_date": price_date,
+        "low52": low52_jmd, "high52": high52_jmd,
+        "eps": eps, "bvps": bvps, "dps": dps,
         "oeps": oeps, "fcfps": fcfps, "oe_detail": oe_detail,
         "g1": g1, "g_sust": g_sust, "discount": discount, "term_g": term_g,
         "methods": methods, "n_core": len(core_vals),
@@ -2708,8 +2925,9 @@ def render_valuation(income, balance, cashflow, currency, ticker,
     ctype = detect_company_type(inc_a, bal_a)
     p = build_metric_panel(inc_a, bal_a, cf_a, ctype)
     ratios = get_ratios(ticker)
+    quote = get_price(ticker)
     r = intrinsic_valuation(inc_a, bal_a, cf_a, p, ratios, ctype,
-                            discount, term_g, currency, ticker, mos)
+                            discount, term_g, currency, ticker, mos, quote)
 
     if p["dataConfidence"] == "low":
         st.warning("Limited or unusual data for this company (" + "; ".join(p["dqFlags"])
@@ -2727,7 +2945,7 @@ def render_valuation(income, balance, cashflow, currency, ticker,
             "lines). The individual methods that could be computed are listed below."
         )
 
-    cur = currency
+    cur = currency or "JMD"
 
     def money(x):
         return "-" if not _fnum(x) else f"{cur} {x:,.2f}"
@@ -2738,9 +2956,11 @@ def render_valuation(income, balance, cashflow, currency, ticker,
         cols[0].metric("Central fair value", money(r["central"]),
                        help=f"Median of {r['n_core']} methods that fit a "
                             f"{type_label.lower()}.")
+        _psrc = r.get("price_source") or "unavailable"
+        _pdate = f" as of {r['price_date']}" if r.get("price_date") else ""
         cols[1].metric("Current price",
                        money(r["price"]) if _fnum(r["price"]) else "n/a",
-                       help="Market cap / shares outstanding (live, cached).")
+                       help=f"Source: {_psrc}{_pdate} (live, cached).")
         if _fnum(r["upside"]):
             cols[2].metric("Upside to fair value", f"{r['upside']*100:+.0f}%",
                            delta=f"{r['upside']*100:+.0f}%", delta_color="normal")
@@ -2764,6 +2984,16 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                 f"Methods span {money(r['low'])} to {money(r['high'])} per share. "
                 "A wide spread means the answer depends heavily on which lens you "
                 "trust; a tight one means the methods agree."
+            )
+
+        if _fnum(r.get("low52")) and _fnum(r.get("high52")):
+            pos = ""
+            if _fnum(r["price"]) and r["high52"] > r["low52"]:
+                frac = (r["price"] - r["low52"]) / (r["high52"] - r["low52"])
+                pos = f" - trading {frac*100:.0f}% of the way up its 12-month range"
+            st.caption(
+                f"52-week price range: {money(r['low52'])} to {money(r['high52'])}"
+                f"{pos}."
             )
 
     st.divider()
@@ -2855,9 +3085,10 @@ def render_valuation(income, balance, cashflow, currency, ticker,
             "the exchange rate - only the JMD figures shown depend on it."
         )
     st.caption(
-        "Every figure is derived from this company's reported statements and the "
-        "site's live market cap. This is a disciplined reading of the numbers, not "
-        "investment advice."
+        "Intrinsic values are derived from this company's reported statements; the "
+        "current price is the latest close from the site's price history (falling "
+        "back to market cap / shares if that feed is unavailable). A disciplined "
+        "reading of the numbers, not investment advice."
     )
 
 
@@ -3098,10 +3329,16 @@ def main():
                         help="How far below fair value you insist on buying, to "
                              "protect against being wrong.") / 100
 
+        st.divider()
+        st.caption(f"Build: {APP_BUILD}")
+
     # Load the three core statements once.
-    income, inc_agg, currency = get_statement(ticker, "Income Statement")
-    balance, bal_agg, _ = get_statement(ticker, "Balance Sheet")
-    cashflow, cf_agg, _ = get_statement(ticker, "Cash Flow")
+    income, inc_agg, cur_i = get_statement(ticker, "Income Statement")
+    balance, bal_agg, cur_b = get_statement(ticker, "Balance Sheet")
+    cashflow, cf_agg, cur_c = get_statement(ticker, "Cash Flow")
+    # Take the currency from whichever statement loaded, so a single failed feed
+    # never leaves it None (which showed up as "None 15.64" in the valuation).
+    currency = cur_i or cur_b or cur_c or "JMD"
 
     if income is None and balance is None:
         st.error(
@@ -3110,6 +3347,17 @@ def main():
             "another ticker."
         )
         return
+
+    missing = [nm for nm, df in (("income statement", income),
+                                 ("balance sheet", balance),
+                                 ("cash-flow statement", cashflow)) if df is None]
+    if missing:
+        st.warning(
+            "Could not load the " + ", ".join(missing) + " for " + ticker
+            + " right now - the data source sometimes throttles rapid requests. "
+            "Figures that depend on it will be blank; reload the page in a moment "
+            "to try again."
+        )
 
     tabs = st.tabs(["Overview", "Verdict", "Income Statement", "Balance Sheet",
                     "Cash Flow", "Decomposition", "Ratios", "Valuation"])
@@ -3186,6 +3434,11 @@ def main():
         with tab:
             if df is None:
                 st.warning(f"{sname} is not available for this company.")
+                _att = _STMT_ATTEMPTS.get((ticker, sname))
+                if _att:
+                    st.caption("Data source URLs tried (click to check directly):")
+                    for _u, _outcome in _att:
+                        st.caption(f"- [{_outcome}]({_u}) — {_outcome}")
                 continue
             st.subheader(sname)
             item = st.selectbox("Choose a line item to analyse",
