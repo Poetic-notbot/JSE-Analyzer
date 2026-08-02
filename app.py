@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02p signal-check table"
+APP_BUILD = "2026-08-02q liquidation test"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -2138,6 +2138,195 @@ def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
         "assets": assets_ps, "assets_total": ps(assets),
         "liab": liab_ps, "book_ps": book_ps,
         "income": income_ps, "checks": checks, "price": price,
+    }
+
+
+def _cagr_of(d):
+    ys = sorted(d)
+    if len(ys) >= 2 and _fnum(d[ys[0]]) and d[ys[0]] > 0:
+        try:
+            return (d[ys[-1]] / d[ys[0]]) ** (1 / (len(ys) - 1)) - 1
+        except Exception:
+            return None
+    return None
+
+
+def liquidation_test(income, balance, cashflow, p, shares, price, currency, recovery=None):
+    """The rigorous version of 'price below receivables/assets'. Computes a
+    Conservative Liquidation Value per share - cash + haircut receivables +
+    haircut inventory, LESS every liability - and a coverage ratio vs the price,
+    THEN gates it with validation checks (receivables collectibility, cash
+    conversion, receivables vs payables, cash burn, dilution, a catalyst). A raw
+    'price < receivables' that fails the net-of-liabilities test is reported as a
+    FALSE signal, with the reason. Returns {} if the balance sheet is too thin."""
+    if not (shares and shares > 0):
+        return {}
+    assets, equity = p.get("assets"), p.get("equity")
+    if not (_fnum(assets) and _fnum(equity)):
+        return {}
+    rr = dict(DEFAULT_RECOVERY)
+    if recovery:
+        rr.update(recovery)
+    cur = currency or "JMD"
+    recv_rate, inv_rate = rr["recv"], rr["inv"]
+
+    cash = p.get("cash") or 0.0
+    total_liab = assets - equity
+    curassets = p.get("curAssets")
+    recv = _last(_pick(balance, "Receivables", "Accounts Receivable", "Net Receivables")) or 0.0
+    inv = _last(_pick(balance, "Inventory", "Inventories")) or 0.0
+    payables = _last(_pick(balance, "Accounts Payable", "Payables",
+                           "Accounts Payable & Accrued")) or 0.0
+    st_debt = p.get("currentDebtDue") or 0.0
+
+    def ps(v):
+        return (v / shares) if _fnum(v) else None
+
+    def m(v):
+        return "-" if not _fnum(v) else f"{cur} {v:,.2f}"
+
+    def m0(v):
+        return f"{cur} {v:,.0f}"
+
+    crlv_ps = ps(cash + recv * recv_rate + inv * inv_rate - total_liab)
+    net_cash_ps = ps(cash - total_liab)
+    ncav_ps = ps(curassets - total_liab) if _fnum(curassets) else None
+    coverage = (crlv_ps / price) if (_fnum(crlv_ps) and _fnum(price) and price > 0) else None
+
+    checks = []
+
+    def add(status, name, text):
+        checks.append({"status": status, "name": name, "text": text})
+
+    add("info", "All liabilities netted, not just debt",
+        f"Every liability on the balance sheet ({m0(total_liab)}) is subtracted - "
+        "payables, borrowings, leases, tax and provisions, not only bank debt. "
+        "Off-balance-sheet items (guarantees, uncapitalised leases, disputes) aren't "
+        "visible here and would need the audited notes.")
+
+    rg = _cagr_of(_row_by_year(balance, "Receivables", "Accounts Receivable", "Net Receivables"))
+    sg = _cagr_of(_row_by_year(income, "Total Revenue", "Revenue"))
+    if _fnum(rg) and _fnum(sg):
+        if rg - sg > 0.15:
+            add("fail", "Receivables outgrowing sales",
+                f"Receivables have grown ~{rg*100:.0f}%/yr against sales ~{sg*100:.0f}%/yr. "
+                "When receivables balloon faster than revenue the company may be booking "
+                f"sales it isn't collecting - the {recv_rate*100:.0f}% recovery assumption "
+                "is likely optimistic, and the discount may be illusory.")
+        elif rg - sg > 0.05:
+            add("warn", "Receivables growing faster than sales",
+                f"Receivables ~{rg*100:.0f}%/yr vs sales ~{sg*100:.0f}%/yr - a yellow flag "
+                "on collectibility; watch the next cash-flow statement.")
+        else:
+            add("pass", "Receivables in line with sales",
+                f"Receivables (~{rg*100:.0f}%/yr) aren't outrunning sales (~{sg*100:.0f}%/yr), "
+                "consistent with real, collectible balances.")
+    add("info", "Ageing not in this data",
+        "The feed has no receivables ageing. Government or large, solvent counterparties "
+        "can justify the haircut; old, disputed or related-party balances would need a "
+        "deeper cut - confirm in the audited notes.")
+
+    ocf_y = _row_by_year(cashflow, "Operating Cash Flow")
+    ni_y = _row_by_year(income, "Net Income to Common", "Net Income")
+    common = sorted(set(ocf_y) & set(ni_y))
+    if common:
+        cum_ocf = sum(ocf_y[y] for y in common)
+        cum_ni = sum(ni_y[y] for y in common)
+        if cum_ni > 0:
+            cc = cum_ocf / cum_ni
+            if cc < 0.5:
+                add("fail", "Profits not backed by cash",
+                    f"Over {len(common)} years operating cash flow was only {cc*100:.0f}% of "
+                    "reported profit - earnings, and the receivables behind them, aren't "
+                    "converting to cash.")
+            elif cc < 0.8:
+                add("warn", "Cash conversion soft",
+                    f"Operating cash flow is {cc*100:.0f}% of profit over {len(common)} years - "
+                    "adequate but worth watching.")
+            else:
+                add("pass", "Earnings backed by cash",
+                    f"Operating cash flow is {cc*100:.0f}% of cumulative profit - the "
+                    "receivables have historically turned into cash.")
+
+    net_recv = recv - payables - st_debt
+    if recv > 0:
+        if net_recv > 0:
+            add("pass", "Receivables exceed near-term claims",
+                f"After netting payables and current debt, net receivables are {m0(net_recv)} "
+                f"({m(ps(net_recv))}/sh) - they aren't merely offsetting what's owed to "
+                "suppliers and lenders.")
+        else:
+            add("warn", "Receivables offset by payables/current debt",
+                "Payables and current debt roughly match or exceed receivables, so much of "
+                "the receivable is already spoken for by near-term claims.")
+
+    fcf = p.get("fcf")
+    if p.get("structurallyWeak") or (p.get("lossYears") or 0) >= max(2, (p.get("totalYears") or 0) - 1):
+        add("fail", "Loss-making - the discount can erode",
+            "The business loses money in most years, so cash burn can consume the asset "
+            "discount before shareholders ever see it. A liquidation floor only helps if "
+            "realisation is near or the losses stop.")
+    elif _fnum(fcf) and fcf < 0:
+        burn_ps = ps(abs(fcf))
+        adj = (crlv_ps - 2 * burn_ps) if (_fnum(crlv_ps) and _fnum(burn_ps)) else None
+        add("warn", "Burning cash",
+            f"Free cash flow is negative (~{m(burn_ps)}/sh a year). If liquidation isn't "
+            f"imminent, subtract a couple of years of burn: adjusted value ~ {m(adj)}/sh.")
+    else:
+        add("pass", "Profitable / cash-generative",
+            "Not burning the discount away - profits or positive cash flow protect the "
+            "asset value while you wait.")
+
+    sh_g, iss = p.get("shareGrowth"), p.get("netIssuance")
+    if _fnum(sh_g) and sh_g > 0.05:
+        add("warn", "Diluting shareholders",
+            f"Share count has grown ~{sh_g*100:.0f}% - issuing stock waters down the very "
+            "discount you're buying.")
+    elif _fnum(iss) and iss < 0:
+        add("pass", "Not diluting / returning capital",
+            "Net buybacks or no issuance - management isn't watering down the discount.")
+
+    if p.get("paysDividend"):
+        add("pass", "A route to value exists",
+            "The company pays dividends, so collected value has a channel back to holders.")
+    else:
+        add("warn", "No visible catalyst",
+            "No dividend or buyback in the data - without a liquidation, sale or payout, "
+            "value can stay trapped for years while management sits on it.")
+
+    fails = sum(1 for c in checks if c["status"] == "fail")
+    order = ["thin", "qualified", "strong", "exceptional"]
+    if not _fnum(coverage):
+        level, summary = "na", "Not enough balance-sheet data for a liquidation test."
+    elif coverage < 1.0:
+        level = "rejected"
+        summary = (f"**Not a real signal.** Once EVERY liability is netted off, conservative "
+                   f"liquidation value is {m(crlv_ps)}/share - below the price of {m(price)} "
+                   f"(coverage {coverage:.2f}x). A raw 'price under receivables' here is an "
+                   "optical bargain: the receivables are already claimed by creditors.")
+    else:
+        base = ("exceptional" if coverage >= 2.0 else "strong" if coverage >= 1.5
+                else "qualified" if coverage >= 1.25 else "thin")
+        if fails >= 2:
+            level = "weak"
+        elif fails == 1:
+            level = order[min(order.index(base), 1)]      # cap at 'qualified'
+        else:
+            level = base
+        head = {"exceptional": "Potentially exceptional", "strong": "Strong asset backing",
+                "qualified": "Some asset backing (caveated)", "thin": "Thin coverage",
+                "weak": "Coverage on paper only"}.get(level, level)
+        summary = (f"**{head}.** Conservative liquidation value {m(crlv_ps)}/share vs price "
+                   f"{m(price)} = **{coverage:.2f}x coverage**. "
+                   + ("The validation checks hold up." if fails == 0
+                      else f"But {fails} check(s) failed - the coverage exists on paper, but "
+                           "collectibility/quality concerns undercut it, so do not treat it "
+                           "as a clean signal."))
+    return {
+        "crlv_ps": crlv_ps, "net_cash_ps": net_cash_ps, "ncav_ps": ncav_ps,
+        "coverage": coverage, "price": price, "recv_rate": recv_rate,
+        "inv_rate": inv_rate, "checks": checks, "level": level, "summary": summary,
+        "recv_material": recv > 0.05 * (assets or 1),
     }
 
 
@@ -4601,6 +4790,50 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                        "the reason). This is why revenue, receivables or liabilities "
                        "sitting either side of the price don't move the needle on "
                        "their own.")
+
+        # ---- Conservative liquidation test (the rigorous asset check) ----
+        lt = liquidation_test(inc_a, bal_a, cf_a, p, r.get("shares"), r.get("price"),
+                              currency, recovery)
+        if lt and lt.get("level") != "na":
+            st.markdown("**Conservative liquidation test** - the rigorous version of "
+                        "“price below its assets”")
+            st.caption(
+                "Cash + haircut receivables + haircut inventory, LESS every liability, "
+                "per share - then coverage vs the price, gated by validation checks. A "
+                "raw 'price below receivables' only counts if it survives all of this."
+            )
+            lc = st.columns(3)
+            lc[0].metric("Liquidation value / share", money(lt.get("crlv_ps")),
+                         help=f"Cash 100% + receivables {lt['recv_rate']*100:.0f}% + "
+                              f"inventory {lt['inv_rate']*100:.0f}% - ALL liabilities. "
+                              "Set the haircuts in the sidebar (e.g. 60% receivables).")
+            lc[1].metric("Net cash / share (all liab.)", money(lt.get("net_cash_ps")))
+            _cov = lt.get("coverage")
+            lc[2].metric("Coverage vs price",
+                         f"{_cov:.2f}x" if _fnum(_cov) else "n/a",
+                         help="Liquidation value / price. Below 1x = the price is NOT "
+                              "covered. 1.5-2x strong, >2x exceptional (but verify).")
+            _lvbg = {"exceptional": "#dafbe1", "strong": "#dafbe1", "qualified": "#fff8c5",
+                     "thin": "#fff8c5", "weak": "#ffebe9", "rejected": "#ffebe9"}
+            _lvfg = {"exceptional": "#1a7f37", "strong": "#1a7f37", "qualified": "#9a6700",
+                     "thin": "#9a6700", "weak": "#cf222e", "rejected": "#cf222e"}
+            lv = lt.get("level")
+            st.markdown("<div style='margin:6px 0;padding:12px 16px;border-radius:10px;"
+                        "background:" + _lvbg.get(lv, "#eaeef2") + ";border:1px solid "
+                        + _lvfg.get(lv, "#57606a") + "44'><span style='color:"
+                        + _lvfg.get(lv, "#57606a") + "'>" + lt.get("summary", "")
+                        + "</span></div>", unsafe_allow_html=True)
+            _icon = {"pass": ("✓", "#1a7f37"), "warn": ("⚠", "#9a6700"),
+                     "fail": ("✗", "#cf222e"), "info": ("•", "#57606a")}
+            for c in lt.get("checks", []):
+                ic, col = _icon.get(c["status"], ("•", "#57606a"))
+                st.markdown("<div style='margin:3px 0'><span style='color:" + col
+                            + ";font-weight:700'>" + ic + " " + _esc(c["name"])
+                            + ".</span> <span style='color:#3a3f45'>" + _esc(c["text"])
+                            + "</span></div>", unsafe_allow_html=True)
+            st.caption("Coverage ladder: <1.0x not covered · 1.0-1.25x thin · "
+                       "1.25-1.5x interesting · 1.5-2x strong · >2x exceptional. A "
+                       "failed check (✗) caps the verdict regardless of the ratio.")
 
     # ---- Why these methods -------------------------------------------------
     with st.expander("Why these methods - and why they have lasted"):
