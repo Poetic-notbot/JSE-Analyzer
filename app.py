@@ -56,7 +56,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-01e income-statement-path"
+APP_BUILD = "2026-08-02a finite-life + asset-backing"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -1621,6 +1621,83 @@ def two_stage_pv(base, g1, term_g, discount, years=10):
     return pv
 
 
+def finite_pv(base, g1, term_g, discount, years, residual=0.0):
+    """Present value of a cash-flow stream over a FIXED life - no perpetual
+    terminal value. For concession/finite-life assets (a toll road, a mine, a
+    single lease) whose cash flows stop when the asset expires or reverts.
+    `residual` is a one-off lump sum received in the final year (e.g. a reverting
+    asset's scrap/book value); usually zero for build-operate-transfer deals."""
+    years = int(years)
+    if not _fnum(base) or discount is None or years < 1:
+        return None
+    if discount <= term_g:
+        term_g = discount - 0.01
+    pv, cf = 0.0, base
+    for yr in range(1, years + 1):
+        g = g1 + (term_g - g1) * (yr - 1) / max(years - 1, 1)
+        cf *= (1 + g)
+        pv += cf / ((1 + discount) ** yr)
+    if residual:
+        pv += residual / ((1 + discount) ** years)
+    return pv
+
+
+# Default recovery rates for a liquidation/salvage estimate - the fraction of
+# each asset's reported book value a seller could realistically recover, net of
+# ALL liabilities at 100%. Roughly Graham/Buffett conventions; user-adjustable.
+DEFAULT_RECOVERY = {"invest": 0.90, "recv": 0.80, "inv": 0.60, "ppe": 0.40, "other": 0.20}
+
+
+def asset_backing(balance, p, shares, recovery=None):
+    """Balance-sheet downside: what the assets alone are worth per share, net of
+    ALL liabilities, at conservative recovery rates. These are FLOORS, not fair
+    values. Returns per-share figures (JMD) or {} if the data is insufficient."""
+    if balance is None or not shares:
+        return {}
+    assets = p.get("assets")
+    equity = p.get("equity")
+    if not (_fnum(assets) and _fnum(equity)):
+        return {}
+    rr = dict(DEFAULT_RECOVERY)
+    if recovery:
+        rr.update(recovery)
+
+    cash   = p.get("cash") or 0.0
+    debt   = p.get("debt") or 0.0
+    ppe    = p.get("ppe") or 0.0
+    cura   = p.get("curAssets") or 0.0
+    invest = _last(_pick(balance, "Total Investments", "Long-Term Investments")) or 0.0
+    recv   = _last(_pick(balance, "Receivables", "Accounts Receivable",
+                         "Net Receivables", "Total Receivables")) or 0.0
+    invy   = _last(_pick(balance, "Inventory", "Inventories", "Total Inventory")) or 0.0
+    total_liab = assets - equity
+
+    known = cash + invest + recv + invy + ppe
+    other = max(assets - known, 0.0)          # everything not separately haircut
+
+    liq_assets = (cash + invest * rr["invest"] + recv * rr["recv"]
+                  + invy * rr["inv"] + ppe * rr["ppe"] + other * rr["other"])
+    liquidation = liq_assets - total_liab
+    nnwc = cash + 0.75 * recv + 0.50 * invy - total_liab      # Graham net-net WC
+    ncav = cura - total_liab                                  # Graham NCAV
+    net_cash = cash - debt
+
+    def ps(x):
+        return x / shares
+    return {
+        "netCashPs": ps(net_cash),
+        "nnwcPs": ps(nnwc),
+        "ncavPs": ps(ncav),
+        "liquidationPs": ps(liquidation),
+        "bookPs": ps(equity),
+        "debtFree": debt <= 0.02 * assets,
+        "hasDebt": debt > 0.02 * assets,
+        "recovery": rr,
+        "parts": {"cash": cash, "invest": invest, "recv": recv, "inv": invy,
+                  "ppe": ppe, "other": other, "liab": total_liab},
+    }
+
+
 def _growth_estimate(p, term_g):
     """A single, deliberately sober stage-1 growth rate for the DCF: the lower of
     earnings and revenue CAGR (so a one-off earnings spike can't run away with
@@ -1657,7 +1734,8 @@ def _perpetual_growth(g_sust, term_g, discount):
 
 
 def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
-                        discount, term_g, currency, ticker, mos=0.25, quote=None):
+                        discount, term_g, currency, ticker, mos=0.25, quote=None,
+                        asset_life=0, residual_pct=0.0, recovery=None):
     """Build a fair value from several long-standing methods, blend the ones that
     suit this kind of business into a central estimate with a range, and compare
     it to the live market price. All per-share figures are returned in JMD.
@@ -1747,24 +1825,37 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
         })
 
     # --- Owner-earnings DCF (Buffett) -- operating businesses only -----------
+    # If a finite asset life is set (e.g. a concession that expires and reverts),
+    # the cash flows stop at that horizon - no perpetual terminal value.
+    finite = _fnum(asset_life) and asset_life and asset_life > 0
+    resid_ps = (residual_pct or 0.0) * (bvps or 0.0)
     oe_dcf = None
     if not fin and _fnum(oeps) and oeps > 0:
-        oe_dcf = two_stage_pv(oeps, g1, term_g, discount, years=10)
-    add("Owner-earnings DCF (Buffett)", oe_dcf, core=True, applies=not fin,
-        basis=f"OE/sh {currency} {oeps:,.2f} - grow {g1*100:.1f}% fading to "
-              f"{term_g*100:.1f}%, discount {discount*100:.1f}%" if _fnum(oeps) else
+        oe_dcf = (finite_pv(oeps, g1, term_g, discount, asset_life, resid_ps)
+                  if finite else two_stage_pv(oeps, g1, term_g, discount, years=10))
+    _dcf_name = (f"Owner-earnings DCF ({int(asset_life)}-yr life)" if finite
+                 else "Owner-earnings DCF (Buffett)")
+    add(_dcf_name, oe_dcf, core=True, applies=not fin,
+        basis=(f"OE/sh {currency} {oeps:,.2f} over {int(asset_life)} yrs then the "
+               f"asset expires" + (f" (residual {currency} {resid_ps:,.2f})" if resid_ps else "")
+               if finite else
+               f"OE/sh {currency} {oeps:,.2f} - grow {g1*100:.1f}% fading to "
+               f"{term_g*100:.1f}%, discount {discount*100:.1f}%") if _fnum(oeps) else
               "owner earnings not positive/available",
         why="A business is worth the cash an owner can pull from it over its life, "
             "discounted to today. Owner earnings = net income + non-cash "
-            "depreciation - the capex needed just to hold position.",
+            "depreciation - the capex needed just to hold position."
+            + (" With a finite asset life the stream stops at expiry rather than "
+               "compounding forever - the right treatment for a concession." if finite else ""),
         note="" if oe_dcf else "Needs positive owner earnings; skipped.")
 
     # --- Free-cash-flow DCF (cross-check for operating businesses) -----------
     fcf_dcf = None
     if not fin and _fnum(fcfps) and fcfps > 0:
-        fcf_dcf = two_stage_pv(fcfps, g1, term_g, discount, years=10)
+        fcf_dcf = (finite_pv(fcfps, g1, term_g, discount, asset_life, resid_ps)
+                   if finite else two_stage_pv(fcfps, g1, term_g, discount, years=10))
     add("Free-cash-flow DCF", fcf_dcf, core=False, applies=not fin,
-        basis=f"FCF/sh {currency} {fcfps:,.2f}, same growth/discount" if _fnum(fcfps)
+        basis=f"FCF/sh {currency} {fcfps:,.2f}, same horizon/discount" if _fnum(fcfps)
               else "free cash flow not positive/available",
         why="The same discounting logic run on reported free cash flow, as an "
             "independent check on the owner-earnings number.")
@@ -1882,6 +1973,8 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
     upside = (central / price - 1) if (_fnum(central) and _fnum(price) and price > 0) else None
     verdict, band = _valuation_verdict(price, central, buy_below)
 
+    backing = asset_backing(balance, p, shares, recovery)
+
     return {
         "fx": fx, "shares": shares, "currency": currency,
         "price": price, "price_source": price_source, "price_date": price_date,
@@ -1889,10 +1982,11 @@ def intrinsic_valuation(income, balance, cashflow, p, ratios, ctype,
         "eps": eps, "bvps": bvps, "dps": dps,
         "oeps": oeps, "fcfps": fcfps, "oe_detail": oe_detail,
         "g1": g1, "g_sust": g_sust, "discount": discount, "term_g": term_g,
+        "asset_life": int(asset_life) if finite else 0,
         "methods": methods, "n_core": len(core_vals),
         "central": central, "low": low, "high": high, "buy_below": buy_below,
         "mos": mos, "upside": upside, "verdict": verdict, "band": band,
-        "ncav": ncav, "graham_n": graham_n,
+        "ncav": ncav, "graham_n": graham_n, "backing": backing, "ctype": ctype,
     }
 
 
@@ -2908,7 +3002,8 @@ _VAL_BAND_BG = {
 
 
 def render_valuation(income, balance, cashflow, currency, ticker,
-                     discount, term_g, mos):
+                     discount, term_g, mos, asset_life=0, residual_pct=0.0,
+                     recovery=None):
     """The Valuation tab: a fair value built from several long-standing methods,
     blended to a central estimate with a range and a margin-of-safety line, then
     compared to the live market price."""
@@ -2927,7 +3022,9 @@ def render_valuation(income, balance, cashflow, currency, ticker,
     ratios = get_ratios(ticker)
     quote = get_price(ticker)
     r = intrinsic_valuation(inc_a, bal_a, cf_a, p, ratios, ctype,
-                            discount, term_g, currency, ticker, mos, quote)
+                            discount, term_g, currency, ticker, mos, quote,
+                            asset_life=asset_life, residual_pct=residual_pct,
+                            recovery=recovery)
 
     if p["dataConfidence"] == "low":
         st.warning("Limited or unusual data for this company (" + "; ".join(p["dqFlags"])
@@ -2937,6 +3034,13 @@ def render_valuation(income, balance, cashflow, currency, ticker,
     st.markdown("<span style='color:#57606a'>Valued as a <b>" + type_label.lower()
                 + "</b> - the methods below are the ones that suit that.</span>",
                 unsafe_allow_html=True)
+    if r.get("asset_life"):
+        st.info(
+            f"**Finite-life mode: {r['asset_life']} years.** The DCF stops at that "
+            "horizon instead of assuming cash flows last forever - the right "
+            "treatment for a concession, mine or single lease that expires. Set "
+            "this back to 0 in the sidebar for an ordinary going concern."
+        )
 
     if not _fnum(r["central"]):
         st.info(
@@ -3050,18 +3154,61 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                            "leaning hard on assumptions - lean more on the "
                            "book-value, dividend and Graham methods instead.")
 
-    # ---- Floors & ceilings ------------------------------------------------
-    bits = []
-    if _fnum(r["ncav"]):
-        bits.append(f"**Liquidation floor (net-net):** {money(r['ncav'])} - current "
-                    "assets less all debt, per share.")
+    # ---- Asset backing & downside -----------------------------------------
+    b = r.get("backing") or {}
+    if b:
+        st.markdown("#### Asset backing & downside")
+        st.caption(
+            "What the assets alone are worth per share, net of ALL debt - the "
+            "floor under the price. If the price sits near or below these, you are "
+            "getting the operating business cheaply or for free."
+        )
+        ac = st.columns(4)
+        ac[0].metric("Net cash / share", money(b.get("netCashPs")),
+                     help="Cash minus all debt, per share. Positive means the "
+                          "company could clear its debt and still hand cash back.")
+        ac[1].metric("Net-net (NNWC)", money(b.get("nnwcPs")),
+                     help="Graham's strictest floor: cash + 75% of receivables + "
+                          "50% of inventory, less ALL liabilities.")
+        ac[2].metric("Liquidation value", money(b.get("liquidationPs")),
+                     help="Assets recovered at the sidebar's haircut rates, less all "
+                          "liabilities. A wind-down estimate.")
+        nav_label = "Book / NAV / share" if r.get("ctype") in ("reit",) else "Book value / share"
+        ac[3].metric(nav_label, money(b.get("bookPs")))
+
+        if r.get("ctype") == "reit":
+            st.caption(
+                "This is a property company, so its investment property is carried "
+                "near fair value - book value here is effectively **net asset value "
+                "(NAV)**, and price-to-book is price-to-NAV."
+            )
+
+        # Plain-language confidence flags, strongest first.
+        price = r.get("price")
+        flags = []
+        if _fnum(price):
+            df_note = " (and it is effectively debt-free)" if b.get("debtFree") else ""
+            if _fnum(b.get("netCashPs")) and price <= b["netCashPs"]:
+                flags.append(("good", "Price is **at or below net cash** - the market "
+                              "is handing you the whole operating business for free" + df_note + "."))
+            if _fnum(b.get("nnwcPs")) and price <= b["nnwcPs"]:
+                flags.append(("good", "Price is **below Graham net-net working capital** - "
+                              "a classic deep-value floor rarely seen in a sound business."))
+            elif _fnum(b.get("liquidationPs")) and price <= b["liquidationPs"]:
+                flags.append(("good", "Price is **below estimated liquidation value** - "
+                              "the assets alone, sold off and debts paid, look worth more "
+                              "than the market cap."))
+            elif _fnum(b.get("bookPs")) and price <= b["bookPs"]:
+                flags.append(("caution", "Price is **below book value** (P/B < 1). Cheap on "
+                              "assets, but confirm the assets are real and earning."))
+        for kind, txt in flags:
+            col = "#1a7f37" if kind == "good" else "#9a6700"
+            st.markdown("<div style='margin:4px 0;color:" + col + "'>• " + txt + "</div>",
+                        unsafe_allow_html=True)
+
     if _fnum(r["graham_n"]):
-        bits.append(f"**Graham ceiling:** {money(r['graham_n'])} - the most a "
-                    "defensive buyer should pay on earnings and book together.")
-    if bits:
-        st.markdown("#### Floors & ceilings")
-        for b in bits:
-            st.markdown("- " + b)
+        st.caption(f"Graham ceiling (upper sanity bound): {money(r['graham_n'])} - the "
+                   "most a defensive buyer should pay on earnings and book together.")
 
     # ---- Why these methods -------------------------------------------------
     with st.expander("Why these methods - and why they have lasted"):
@@ -3328,6 +3475,30 @@ def main():
         mos = st.slider("Margin of safety (%)", 0.0, 50.0, 25.0, 5.0,
                         help="How far below fair value you insist on buying, to "
                              "protect against being wrong.") / 100
+        asset_life = st.slider("Concession / asset life (years, 0 = forever)",
+                               0, 40, 0, 1,
+                               help="For businesses whose cash flows END on a date - "
+                                    "a toll-road concession, a mine, a single lease. "
+                                    "Set the years remaining and the DCF stops there "
+                                    "instead of assuming the cash lasts forever. Leave "
+                                    "at 0 for ordinary going concerns like TJH's "
+                                    "concession.")
+        residual_pct = 0.0
+        recovery = dict(DEFAULT_RECOVERY)
+        with st.expander("Liquidation recovery rates (advanced)"):
+            if asset_life > 0:
+                residual_pct = st.slider("Residual value at expiry (% of book)",
+                                         0, 100, 0, 5,
+                                         help="What equity holders recover when the "
+                                              "asset expires/reverts. Usually 0 for a "
+                                              "build-operate-transfer concession.") / 100
+            st.caption("Fraction of each asset's book value recovered in a wind-down "
+                       "(cash is always 100%, all debts paid in full).")
+            recovery["recv"]  = st.slider("Receivables recovered (%)", 0, 100, 80, 5) / 100
+            recovery["inv"]   = st.slider("Inventory recovered (%)", 0, 100, 60, 5) / 100
+            recovery["ppe"]   = st.slider("Property, plant & equipment recovered (%)",
+                                          0, 100, 40, 5) / 100
+            recovery["other"] = st.slider("Other assets recovered (%)", 0, 100, 20, 5) / 100
 
         st.divider()
         st.caption(f"Build: {APP_BUILD}")
@@ -3565,7 +3736,7 @@ def main():
     # ---- Valuation --------------------------------------------------------
     with tabs[7]:
         render_valuation(income, balance, cashflow, currency, ticker,
-                         discount, term_g, mos)
+                         discount, term_g, mos, asset_life, residual_pct, recovery)
 
 
 if __name__ == "__main__":
