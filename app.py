@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02f screener value + peers"
+APP_BUILD = "2026-08-02g watchlist"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -3788,6 +3788,126 @@ def build_universe():
         df = df.sort_values("Score", ascending=False).reset_index(drop=True)
     return df
 
+
+# ---------------------------------------------------------------------------
+# Watchlist - a small set of flagged tickers with a one-line thesis each. The
+# list lives in the page URL (?watch=CAR,TJH,...) so it survives a refresh and can
+# be bookmarked or shared, with no server-side storage.
+# ---------------------------------------------------------------------------
+
+def get_watchlist():
+    raw = st.query_params.get("watch", "")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    return [t.strip().upper() for t in str(raw).split(",") if t.strip()]
+
+
+def set_watchlist(tickers):
+    seen, clean = set(), []
+    for t in tickers:
+        u = t.upper()
+        if u and u not in seen:
+            seen.add(u)
+            clean.append(u)
+    if clean:
+        st.query_params["watch"] = ",".join(clean)
+    else:
+        try:
+            del st.query_params["watch"]
+        except Exception:
+            st.query_params["watch"] = ""
+
+
+def toggle_watch(ticker):
+    wl = get_watchlist()
+    u = ticker.upper()
+    if u in wl:
+        wl.remove(u)
+    else:
+        wl.append(u)
+    set_watchlist(wl)
+
+
+def watchlist_thesis(ticker, companies):
+    """A compact one-line read for a watched ticker: quality, value vs price, the
+    growth the price implies, and dividend safety. Fixed screen assumptions."""
+    income, _, cur = get_statement(ticker, "Income Statement")
+    balance, _, _ = get_statement(ticker, "Balance Sheet")
+    cash, _, _ = get_statement(ticker, "Cash Flow")
+    name = companies.get(ticker, ticker)
+    if income is None and balance is None:
+        return {"Ticker": ticker, "Company": name, "Score": None, "Band": "no data",
+                "Value": "—", "Upside %": None, "Price": None, "Fair value": None,
+                "Priced-in growth": "-", "Dividend": "-"}
+    a = assess_business(income, balance, cash)
+    p = a["panel"]
+    rv = intrinsic_valuation(income, balance, cash, p, {}, a["ctype"],
+                             0.12, 0.02, cur or "JMD", ticker, 0.25,
+                             quote=get_price(ticker))
+    up = rv.get("upside")
+    value_lbl = ("Undervalued" if (isinstance(up, (int, float)) and up >= 0.25)
+                 else "Overvalued" if (isinstance(up, (int, float)) and up <= -0.20)
+                 else "Around fair" if isinstance(up, (int, float)) else "—")
+    base = (rv.get("oeps") if (_fnum(rv.get("oeps")) and rv["oeps"] > 0)
+            else rv.get("dps") if (_fnum(rv.get("dps")) and rv["dps"] > 0) else None)
+    gtxt = "-"
+    if base and _fnum(rv.get("price")):
+        ig = implied_growth(base, rv["price"], 0.02, 0.12,
+                            finite=bool(rv.get("asset_life")),
+                            years=rv.get("asset_life") or 10)
+        if ig:
+            gtxt = ({"below": "decline priced in", "above": ">60%/yr"}
+                    .get(ig[0], f"{ig[1]*100:.0f}%/yr"))
+    dv = rv.get("dividend") or {}
+    if dv.get("yield") is not None:
+        safe = (dv.get("safety") or ("", ""))[0]
+        dtxt = f"{dv['yield']*100:.1f}% ({safe})" if safe else f"{dv['yield']*100:.1f}%"
+    else:
+        dtxt = "none"
+    return {
+        "Ticker": ticker, "Company": name,
+        "Score": a["overall"], "Band": a["band"], "Value": value_lbl,
+        "Upside %": round(up * 100, 1) if isinstance(up, (int, float)) else None,
+        "Price": round(rv["price"], 2) if _fnum(rv.get("price")) else None,
+        "Fair value": round(rv["central"], 2) if _fnum(rv.get("central")) else None,
+        "Priced-in growth": gtxt, "Dividend": dtxt,
+    }
+
+
+def render_watchlist(companies):
+    """The Watchlist mode: a one-line thesis for each flagged ticker."""
+    st.title("Watchlist")
+    wl = get_watchlist()
+    if not wl:
+        st.info("Your watchlist is empty. Open a company under **Analyze one "
+                "company** and use **☆ Add to watchlist** in the sidebar. The list "
+                "is saved in this page's URL, so you can bookmark or share it.")
+        return
+    st.caption("One line per name: quality score, value vs price, the growth the "
+               "price is implying, and dividend safety. Fixed screen assumptions "
+               "(12% discount, 2% terminal). Saved in the page URL.")
+
+    rows = [watchlist_thesis(t, companies) for t in wl]
+    df = pd.DataFrame(rows)
+    _vcolor = {"Undervalued": "#dafbe1", "Overvalued": "#ffebe9",
+               "Around fair": "#fff8c5"}
+    fmt = {"Upside %": "{:+.0f}%", "Price": "{:,.2f}", "Fair value": "{:,.2f}"}
+
+    def _style(d):
+        return (d.style.format(fmt, na_rep="-")
+                .map(lambda v: f"background-color:{_vcolor.get(v, '')}",
+                     subset=["Value"] if "Value" in d.columns else []))
+    st.dataframe(_style(df), use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns([3, 1])
+    drop = c1.multiselect("Remove from watchlist", wl)
+    if c2.button("Remove", use_container_width=True) and drop:
+        set_watchlist([t for t in wl if t not in drop])
+        st.rerun()
+    st.download_button("Download watchlist as CSV", df.to_csv(index=False),
+                       "jse_watchlist.csv", "text/csv")
+
+
 def render_compare():
     """Compare/screen the whole exchange: by industry, quality (investible
     universe), various metrics, and arbitrary head-to-head."""
@@ -3989,9 +4109,15 @@ def main():
     )
 
     companies = get_companies()
-    mode = st.sidebar.radio("Mode", ["Analyze one company", "Compare companies"])
+    _wl = get_watchlist()
+    mode = st.sidebar.radio(
+        "Mode", ["Analyze one company", "Compare companies",
+                 f"Watchlist ({len(_wl)})" if _wl else "Watchlist"])
     if mode == "Compare companies":
         render_compare()
+        return
+    if mode.startswith("Watchlist"):
+        render_watchlist(companies)
         return
     labels = [f"{t} \u2014 {n}" for t, n in companies.items()]
     sym_by_label = {f"{t} \u2014 {n}": t for t, n in companies.items()}
@@ -4002,6 +4128,12 @@ def main():
         chosen = st.selectbox("Select a ticker", labels,
                               index=labels.index(default) if default in labels else 0)
         ticker = sym_by_label[chosen]
+
+        _in_wl = ticker.upper() in get_watchlist()
+        if st.button(("\u2605 Remove from watchlist" if _in_wl else "\u2606 Add to watchlist"),
+                     use_container_width=True):
+            toggle_watch(ticker)
+            st.rerun()
 
         st.header("Valuation assumptions")
         discount = st.slider("Discount rate / required return (%)", 6.0, 20.0, 12.0, 0.5,
