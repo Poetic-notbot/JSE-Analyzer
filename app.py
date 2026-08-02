@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02l ratios-history bands"
+APP_BUILD = "2026-08-02m ratios bands (labelless)"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -436,7 +436,8 @@ def get_ratios_history(ticker):
     history arrays (more reliable than reconstructing them from prices). Cached 6h.
     Returns {'pe':{year:val}, 'pb':{year:val}, 'yield':{year:val}} or {}."""
     return _memo(("rhist", ticker), lambda: _load_ratios_history(ticker),
-                 lambda r: bool(r and (r.get("pe") or r.get("pb") or r.get("yield"))))
+                 lambda r: bool(r and any((r.get(k) or {}).get("vals")
+                                          for k in ("pe", "pb", "yield"))))
 
 
 def _load_ratios_history(ticker):
@@ -458,8 +459,7 @@ def _load_ratios_history(ticker):
     if node is None:
         return {}
     labels = node.get("fiscalYear") or node.get("datekey") or []
-    if not isinstance(labels, list) or not labels:
-        return {}
+    labels = labels if isinstance(labels, list) else []
 
     def arr(*keys):
         for k in keys:
@@ -468,23 +468,30 @@ def _load_ratios_history(ticker):
                 return v
         return []
 
-    pe, pb = arr("pe"), arr("pb", "pbRatio")
-    dy = arr("dividendyield", "dividendYield")
-    out = {"pe": {}, "pb": {}, "yield": {}}
-    for i, lab in enumerate(labels):
-        if str(lab).upper() == "TTM":
-            continue
-        try:
-            yr = int(str(lab)[:4])
-        except Exception:
-            continue
-        if i < len(pe) and _fnum(pe[i]) and pe[i] > 0:
-            out["pe"][yr] = float(pe[i])
-        if i < len(pb) and _fnum(pb[i]) and pb[i] > 0:
-            out["pb"][yr] = float(pb[i])
-        if i < len(dy) and _fnum(dy[i]) and dy[i] > 0:
-            out["yield"][yr] = float(dy[i])
-    return out
+    def build(vals):
+        """A metric array -> {'vals': [historical values], 'byYear': {yr: val}}.
+        Index 0 is the TTM/current column, excluded from the historical band. Year
+        labels are used only for the chart and are optional - the band stats work
+        from the values alone."""
+        out_vals, by_year = [], {}
+        for i, v in enumerate(vals):
+            is_ttm = (str(labels[i]).upper() == "TTM") if i < len(labels) else (i == 0)
+            if is_ttm:
+                continue
+            if _fnum(v) and v > 0:
+                out_vals.append(float(v))
+                if i < len(labels):
+                    try:
+                        by_year[int(str(labels[i])[:4])] = float(v)
+                    except Exception:
+                        pass
+        return {"vals": out_vals, "byYear": by_year}
+
+    return {
+        "pe": build(arr("pe", "peRatio")),
+        "pb": build(arr("pb", "pbRatio")),
+        "yield": build(arr("dividendyield", "dividendYield")),
+    }
 
 
 # Candidate key names the price-history feed might use for the date and the
@@ -2372,12 +2379,15 @@ def valuation_history(rhist, income, balance, cashflow, price_series, fx,
     """Per-year P/E, P/B and dividend yield versus today, so a stock can be judged
     against its OWN valuation history. Prefers the ratios feed's own history arrays
     (`rhist`); falls back to reconstructing them from year-end prices. Returns {}."""
-    pe = dict((rhist or {}).get("pe") or {})
-    pb = dict((rhist or {}).get("pb") or {})
-    dy = dict((rhist or {}).get("yield") or {})
+    pe = dict(((rhist or {}).get("pe") or {}).get("byYear") or {})
+    pb = dict(((rhist or {}).get("pb") or {}).get("byYear") or {})
+    dy = dict(((rhist or {}).get("yield") or {}).get("byYear") or {})
+    pe_vals = list(((rhist or {}).get("pe") or {}).get("vals") or [])
+    pb_vals = list(((rhist or {}).get("pb") or {}).get("vals") or [])
+    dy_vals = list(((rhist or {}).get("yield") or {}).get("vals") or [])
 
     # Fallback: reconstruct from prices only if the ratios history is thin.
-    if len(pe) < 3 and price_series and len(price_series) >= 40:
+    if len(pe_vals) < 3 and price_series and len(price_series) >= 40:
         raw_last = price_series[-1][1]
         mult = fx if (_fnum(cur_price) and _fnum(raw_last) and raw_last > 0
                       and cur_price / raw_last > 10) else 1.0
@@ -2397,23 +2407,23 @@ def valuation_history(rhist, income, balance, cashflow, price_series, fx,
                 pb[y] = px / (eq[y] / sh)
             if y in dvd and dvd[y]:
                 dy[y] = (abs(dvd[y]) / sh) / px
+        pe_vals, pb_vals, dy_vals = list(pe.values()), list(pb.values()), list(dy.values())
 
-    def stat(hist, cur, higher_is_cheaper=False):
-        vals = list(hist.values())
+    def stat(vals, by_year, cur, higher_is_cheaper=False):
         if len(vals) < 3 or not _fnum(cur):
             return None
         p = _pctile(cur, vals)
         if higher_is_cheaper and p is not None:
             p = 1 - p
         return {"current": cur, "median": _median(vals), "low": min(vals),
-                "high": max(vals), "cheap_pctile": p, "series": hist, "n": len(vals)}
+                "high": max(vals), "cheap_pctile": p, "series": by_year, "n": len(vals)}
 
     cur_yield = _safe_div(cur_dps, cur_price) if (_fnum(cur_dps) and _fnum(cur_price)
                                                   and cur_price > 0) else None
     return {
-        "pe": stat(pe, _safe_div(cur_price, cur_eps) if (_fnum(cur_eps) and cur_eps > 0) else None),
-        "pb": stat(pb, _safe_div(cur_price, cur_bvps) if (_fnum(cur_bvps) and cur_bvps > 0) else None),
-        "yield": stat(dy, cur_yield, higher_is_cheaper=True),
+        "pe": stat(pe_vals, pe, _safe_div(cur_price, cur_eps) if (_fnum(cur_eps) and cur_eps > 0) else None),
+        "pb": stat(pb_vals, pb, _safe_div(cur_price, cur_bvps) if (_fnum(cur_bvps) and cur_bvps > 0) else None),
+        "yield": stat(dy_vals, dy, cur_yield, higher_is_cheaper=True),
     }
 
 
