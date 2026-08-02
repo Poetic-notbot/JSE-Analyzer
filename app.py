@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02h valuation history + dividends"
+APP_BUILD = "2026-08-02i quality + liquidity"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -2387,6 +2387,113 @@ def dividend_history(cashflow, income):
             "cagr": cagr, "paid": paid, "years": len(years), "verdict": verdict}
 
 
+def earnings_quality(income, balance, cashflow, p):
+    """Forensic red-flags: is reported profit backed by cash, are working-capital
+    items ballooning, is the balance sheet stretched? Returns flags + a verdict."""
+    rev = _row_by_year(income, "Total Revenue", "Revenue")
+    ni  = _row_by_year(income, "Net Income to Common", "Net Income")
+    ocf = _row_by_year(cashflow, "Operating Cash Flow")
+    assets = _row_by_year(balance, "Total Assets")
+    recv = _row_by_year(balance, "Receivables", "Accounts Receivable", "Net Receivables")
+    inv  = _row_by_year(balance, "Inventory", "Inventories")
+
+    def last_two(d):
+        ys = sorted(d)
+        return (d[ys[-2]], d[ys[-1]]) if len(ys) >= 2 else (None, None)
+
+    flags = []
+    ys = sorted(set(ni) & set(ocf))
+    ocf_ni = None
+    if ys:
+        y = ys[-1]
+        if ni[y] > 0:
+            ocf_ni = ocf[y] / ni[y]
+    if _fnum(ocf_ni) and ocf_ni < 0.7:
+        flags.append(("high" if ocf_ni < 0.4 else "medium",
+                      f"Only {ocf_ni*100:.0f}% of last year's reported profit showed up "
+                      "as operating cash - earnings aren't fully backed by cash."))
+    if ys and assets:
+        y = ys[-1]
+        ay = assets.get(y)
+        if _fnum(ay) and ay > 0:
+            accr = (ni[y] - ocf[y]) / ay
+            if accr > 0.10:
+                flags.append(("medium", f"High accruals: net income ran {accr*100:.0f}% "
+                              "of assets ahead of operating cash - profit leans on "
+                              "non-cash items."))
+    r0, r1 = last_two(recv)
+    s0, s1 = last_two(rev)
+    rg = sg = None
+    if all(_fnum(x) and x > 0 for x in (r0, r1, s0, s1)):
+        rg, sg = r1 / r0 - 1, s1 / s0 - 1
+        if rg - sg > 0.15:
+            flags.append(("medium", f"Receivables grew {rg*100:.0f}% while sales grew "
+                          f"{sg*100:.0f}% - customers are paying slower, or revenue is "
+                          "booked ahead of cash."))
+    i0, i1 = last_two(inv)
+    if all(_fnum(x) and x > 0 for x in (i0, i1)) and _fnum(sg):
+        ig = i1 / i0 - 1
+        if ig - sg > 0.20:
+            flags.append(("medium", f"Inventory grew {ig*100:.0f}% vs sales "
+                          f"{sg*100:.0f}% - stock is piling up faster than it sells."))
+    ic = p.get("intCover")
+    if _fnum(ic) and ic < 3:
+        flags.append(("high" if ic < 1.5 else "medium", f"Interest cover of {ic:.1f}x "
+                      "is thin - little cushion if earnings dip or rates rise."))
+    shg = p.get("shareGrowth")
+    if _fnum(shg) and shg > 0.10:
+        flags.append(("medium", f"Share count grew ~{shg*100:.0f}% over the period - "
+                      "existing holders are being diluted."))
+    if _fnum(p.get("equity")) and p["equity"] < 0:
+        flags.append(("high", "Negative book equity - liabilities exceed assets."))
+
+    highs = sum(1 for s, _ in flags if s == "high")
+    meds = sum(1 for s, _ in flags if s == "medium")
+    if highs >= 1 or meds >= 3:
+        overall = ("bad", "Several earnings-quality concerns - read the notes before "
+                   "trusting the headline profit.")
+    elif meds >= 1:
+        overall = ("caution", "A few things to watch, but nothing alarming.")
+    else:
+        overall = ("good", "Earnings look clean - profit is backed by cash and the "
+                   "balance sheet isn't sending warning signs.")
+    return {"flags": flags, "overall": overall, "ocfNi": ocf_ni,
+            "cashConv": p.get("cashConversion")}
+
+
+def liquidity_read(series):
+    """A tradability proxy from the daily close series: on thin JSE names the close
+    is unchanged for long stretches (no trades). Exact $-turnover would need volume,
+    which this feed doesn't carry, so this is labelled a proxy."""
+    if not series or len(series) < 20:
+        return {}
+    recent = series[-60:]
+    closes = [c for _, c in recent if _fnum(c)]
+    if len(closes) < 10:
+        return {}
+    unchanged = sum(1 for i in range(1, len(closes)) if closes[i] == closes[i - 1])
+    frac = unchanged / (len(closes) - 1)
+    moves = [abs(closes[i] / closes[i - 1] - 1) for i in range(1, len(closes))
+             if closes[i - 1] > 0]
+    avgmove = (sum(moves) / len(moves)) if moves else None
+    if frac > 0.5:
+        kind, label = "bad", "very thinly traded"
+        note = ("The price is unchanged on most days - trades happen rarely. Building "
+                "or exiting any real position will be slow and can move the price.")
+    elif frac > 0.3:
+        kind, label = "caution", "thinly traded"
+        note = ("Many days see no price change. Use limit orders and expect to "
+                "accumulate slowly.")
+    elif frac > 0.15:
+        kind, label = "neutral", "moderately traded"
+        note = "Trades regularly, but large orders may still move the price."
+    else:
+        kind, label = "good", "reasonably liquid"
+        note = "Trades on most days; a normal-sized position should be workable."
+    return {"unchangedFrac": frac, "avgMove": avgmove, "kind": kind,
+            "label": label, "note": note, "n": len(closes)}
+
+
 def _pct(x):
     return "-" if not _fnum(x) else "{:.1f}%".format(x * 100)
 
@@ -3654,6 +3761,64 @@ def render_history(income, balance, cashflow, currency, ticker):
                         use_container_width=True)
 
 
+def render_quality(income, balance, cashflow, currency, ticker):
+    """Quality tab: earnings-quality forensic flags and a tradability read."""
+    st.subheader("Earnings quality & tradability")
+    st.caption("Two ways a good-looking headline can still hurt you: profit that "
+               "isn't backed by cash, and a stock too thin to actually trade.")
+    inc_a, bal_a, cf_a = _align_to_complete_years(income, balance, cashflow)
+    ctype = detect_company_type(inc_a, bal_a)
+    p = build_metric_panel(inc_a, bal_a, cf_a, ctype)
+    eq = earnings_quality(inc_a, bal_a, cf_a, p)
+
+    st.markdown("#### Earnings quality")
+    kind, txt = eq["overall"]
+    col = {"good": "#1a7f37", "caution": "#9a6700", "bad": "#cf222e"}.get(kind, "#57606a")
+    bg = {"good": "#dafbe1", "caution": "#fff8c5", "bad": "#ffebe9"}.get(kind, "#eaeef2")
+    st.markdown("<div style='margin:6px 0;padding:12px 16px;border-radius:10px;"
+                "background:" + bg + ";border:1px solid " + col + "44'>"
+                "<b style='color:" + col + "'>" + txt + "</b></div>",
+                unsafe_allow_html=True)
+    if _fnum(eq.get("ocfNi")):
+        mc = st.columns(2)
+        mc[0].metric("Operating cash / profit", f"{eq['ocfNi']*100:.0f}%",
+                     help="How much of reported net income turned into operating "
+                          "cash last year. Below ~70% is a yellow flag.")
+        if _fnum(eq.get("cashConv")):
+            mc[1].metric("Free cash / profit", f"{eq['cashConv']*100:.0f}%")
+    sev = {"high": ("#cf222e", "HIGH"), "medium": ("#9a6700", "WATCH")}
+    if eq["flags"]:
+        for s, text in sorted(eq["flags"], key=lambda f: 0 if f[0] == "high" else 1):
+            c, tag = sev.get(s, ("#57606a", ""))
+            st.markdown("<div style='margin:5px 0'><span style='font-weight:700;color:"
+                        + c + "'>[" + tag + "]</span> " + text + "</div>",
+                        unsafe_allow_html=True)
+    else:
+        st.caption("No forensic flags tripped on the reported figures.")
+
+    st.divider()
+    st.markdown("#### Tradability (liquidity)")
+    liq = liquidity_read(get_price_history(ticker))
+    if not liq:
+        st.info("Not enough price history to gauge how thinly this trades.")
+    else:
+        lc = {"good": "#1a7f37", "caution": "#9a6700", "bad": "#cf222e",
+              "neutral": "#57606a"}.get(liq["kind"], "#57606a")
+        st.markdown("<div style='margin:4px 0'><b style='color:" + lc + "'>"
+                    + liq["label"].capitalize() + ".</b> " + liq["note"] + "</div>",
+                    unsafe_allow_html=True)
+        qc = st.columns(2)
+        qc[0].metric("Days with no price change",
+                     f"{liq['unchangedFrac']*100:.0f}%",
+                     help="Over the last ~60 trading days on file. High means trades "
+                          "are rare - a thinly-traded stock.")
+        if _fnum(liq.get("avgMove")):
+            qc[1].metric("Average daily move", f"{liq['avgMove']*100:.1f}%")
+        st.caption("A proxy from daily closes - this data feed doesn't carry share "
+                   "volume, so exact J$ turnover isn't shown. Unchanged-price days are "
+                   "the tell for a stock that rarely trades.")
+
+
 def render_valuation(income, balance, cashflow, currency, ticker,
                      discount, term_g, mos, asset_life=0, residual_pct=0.0,
                      recovery=None):
@@ -4470,7 +4635,7 @@ def main():
 
     tabs = st.tabs(["Overview", "Verdict", "Income Statement", "Balance Sheet",
                     "Cash Flow", "Decomposition", "Ratios", "Valuation", "Momentum",
-                    "History"])
+                    "History", "Quality"])
 
     # ---- Overview ---------------------------------------------------------
     with tabs[0]:
@@ -4684,6 +4849,10 @@ def main():
     # ---- History (valuation bands + dividend record) ---------------------
     with tabs[9]:
         render_history(income, balance, cashflow, currency, ticker)
+
+    # ---- Quality (earnings quality + liquidity) --------------------------
+    with tabs[10]:
+        render_quality(income, balance, cashflow, currency, ticker)
 
 
 if __name__ == "__main__":
