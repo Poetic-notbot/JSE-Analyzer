@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02e quarterly / TTM momentum"
+APP_BUILD = "2026-08-02f screener value + peers"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -3719,10 +3719,12 @@ def render_valuation(income, balance, cashflow, currency, ticker,
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner="Scoring the JSE universe...")
+@st.cache_data(ttl=60 * 60, show_spinner="Scoring the JSE universe...")
 def build_universe():
-    """Score every JSE company once and return a tidy comparison table.
-    Reuses assess_business() so scores/stamps match the single-company view."""
+    """Score and value every JSE company once, returning a tidy comparison table
+    ordered strongest-first. Reuses assess_business() and intrinsic_valuation() so
+    the numbers match the single-company view. Price comes from the same price-
+    history feed the single view uses (the ratios feed is unreliable in bulk)."""
     rows = []
     panel_for = {}
     companies = get_companies()
@@ -3737,22 +3739,26 @@ def build_universe():
             p = a["panel"]
             panel_for[tkr] = p
             fxc = _FX_CONTEXT.get(tkr, {})
+
             def pct(x):
                 return round(x * 100, 1) if isinstance(x, (int, float)) else None
+
             def num(x, nd=2):
                 return round(x, nd) if isinstance(x, (int, float)) else None
 
-            # Fair-value read at fixed, screen-wide assumptions (so it stays cached
-            # and comparable across the whole exchange).
-            rv = intrinsic_valuation(income, balance, cash, p, get_ratios(tkr),
+            # Skip the (bulk-unreliable) ratios feed; price comes from the history
+            # feed via quote, and the currency anchor is book value per share.
+            rv = intrinsic_valuation(income, balance, cash, p, {},
                                      a["ctype"], 0.12, 0.02, "JMD", tkr, 0.25,
-                                     quote=None)
+                                     quote=get_price(tkr))
+            price, eps, bvps = rv.get("price"), rv.get("eps"), rv.get("bvps")
             up = rv.get("upside")
-            if isinstance(up, (int, float)):
-                value_lbl = ("Undervalued" if up >= 0.25 else
-                             "Overvalued" if up <= -0.20 else "Around fair")
-            else:
-                value_lbl = "—"
+            value_lbl = ("Undervalued" if (isinstance(up, (int, float)) and up >= 0.25)
+                         else "Overvalued" if (isinstance(up, (int, float)) and up <= -0.20)
+                         else "Around fair" if isinstance(up, (int, float)) else "—")
+            pe = (price / eps) if (_fnum(price) and _fnum(eps) and eps > 0) else None
+            pb = (price / bvps) if (_fnum(price) and _fnum(bvps) and bvps > 0) else None
+            dy = (rv.get("dividend") or {}).get("yield")
             rows.append({
                 "Ticker": tkr,
                 "Company": name,
@@ -3761,25 +3767,26 @@ def build_universe():
                 "Band": a["band"],
                 "Value": value_lbl,
                 "Upside %": pct(up),
+                "Price": num(price),
                 "Fair value": num(rv.get("central")),
-                "Price": num(rv.get("price")),
+                "P/E": num(pe, 1),
+                "P/B": num(pb, 1),
+                "Div yield %": pct(dy),
                 "ROE %": pct(p.get("roe")),
                 "Op margin %": pct(p.get("opMargin")),
                 "Net margin %": pct(p.get("netMargin")),
-                "FCF margin %": pct(p.get("fcfMargin")),
                 "Rev CAGR %": pct(p.get("revCagr")),
-                "ROIC %": pct(p.get("roic")),
-                "ROA %": pct(p.get("roa")),
-                "Net debt/EBIT": num(p.get("netDebtToEbit")),
-                "Equity/assets %": pct(p.get("equityToAssets")),
-                "Interest cover": num(p.get("intCover")),
+                "Net debt/EBIT": num(p.get("netDebtToEbit"), 1),
                 "Reported ccy": fxc.get("reported", "JMD"),
                 "Stamps": ", ".join(s.get("name", "") for s in a.get("stamps", [])),
             })
         except Exception:
             continue
     st.session_state["panel_for"] = panel_for
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    return df
 
 def render_compare():
     """Compare/screen the whole exchange: by industry, quality (investible
@@ -3799,8 +3806,8 @@ def render_compare():
         investible = c1.checkbox("Investible universe only (score > 70)", value=True)
         types = c2.multiselect("Industry / type", sorted(uni["Type"].unique()))
         sort_by = c3.selectbox("Rank by", [
-            "Upside %", "Score", "ROE %", "Op margin %", "Net margin %",
-            "FCF margin %", "Rev CAGR %", "Interest cover",
+            "Quality (strongest first)", "Upside to fair value", "ROE %",
+            "Op margin %", "Rev CAGR %", "Div yield %",
             "Net debt/EBIT (low to high)",
         ])
 
@@ -3810,26 +3817,52 @@ def render_compare():
         if types:
             view = view[view["Type"].isin(types)]
 
+        _sortmap = {"Quality (strongest first)": "Score",
+                    "Upside to fair value": "Upside %"}
         ascending = "low to high" in sort_by
-        key = sort_by.split(" (")[0].strip()
+        key = _sortmap.get(sort_by, sort_by.split(" (")[0].strip())
         view = view.sort_values(key, ascending=ascending, na_position="last")
 
-        st.caption(f"{len(view)} companies match. \"Value\" compares price to a "
-                   "blended fair value at fixed screen assumptions (12% discount, "
-                   "2% terminal growth, 25% margin of safety) - a first pass, not a "
-                   "substitute for the per-company Valuation tab.")
+        st.caption(f"{len(view)} companies, strongest first by default. **Value** "
+                   "compares price to a blended fair value at fixed screen "
+                   "assumptions (12% discount, 2% terminal growth) - a first pass, "
+                   "not a substitute for the per-company Valuation tab.")
+
+        # Clean, per-column number formatting (no ragged decimals / stray zeros).
+        _pcols = ["Upside %", "Div yield %", "ROE %", "Op margin %", "Net margin %",
+                  "Rev CAGR %"]
+        fmt = {c: "{:.1f}%" for c in _pcols if c in view.columns}
+        fmt["Upside %"] = "{:+.0f}%"
+        for c in ("Price", "Fair value"):
+            if c in view.columns:
+                fmt[c] = "{:,.2f}"
+        for c in ("P/E", "P/B", "Net debt/EBIT"):
+            if c in view.columns:
+                fmt[c] = "{:.1f}"
         _vcolor = {"Undervalued": "#dafbe1", "Overvalued": "#ffebe9",
                    "Around fair": "#fff8c5"}
 
         def _style_screen(df):
-            sty = df.style
-            if "Value" in df.columns:
-                sty = sty.map(lambda v: f"background-color:{_vcolor.get(v, '')}",
-                              subset=["Value"])
-            return sty
+            return (df.style
+                    .format(fmt, na_rep="-")
+                    .map(lambda v: f"background-color:{_vcolor.get(v, '')}",
+                         subset=["Value"] if "Value" in df.columns else []))
         st.dataframe(_style_screen(view), use_container_width=True, hide_index=True)
         st.download_button("Download as CSV", view.to_csv(index=False),
                            "jse_screen.csv", "text/csv")
+
+        # ---- Peer-relative: how each valuation multiple sits vs its sector ----
+        with st.expander("Sector medians (peer-relative valuation)"):
+            st.caption("A company can look cheap on its own yet be dear versus its "
+                       "peers, or vice-versa. These are the median multiples by "
+                       "industry across the scored universe.")
+            med = (uni.groupby("Type")[["P/E", "P/B", "Div yield %", "ROE %"]]
+                   .median(numeric_only=True).round(1))
+            med["# cos"] = uni.groupby("Type").size()
+            st.dataframe(med.style.format({"P/E": "{:.1f}", "P/B": "{:.1f}",
+                                           "Div yield %": "{:.1f}%",
+                                           "ROE %": "{:.1f}%"}, na_rep="-"),
+                         use_container_width=True)
 
     with tab_h2h:
         options = [f"{r.Ticker} \u2014 {r.Company}" for r in uni.itertuples()]
