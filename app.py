@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02r type-aware asset checks"
+APP_BUILD = "2026-08-02s dedupe receivables subtotal"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -1213,6 +1213,18 @@ def decomposable_parents(df, aggregates, statement):
     return parents, eff_aggs
 
 
+def _shared_stem(a, b, n=6):
+    """True if the two line-item names share a run of >= n letters (case-folded,
+    letters only) - i.e. they belong to the same family, like 'Receivables' and
+    'Accounts Receivable' (both contain 'receiv'/'receivabl'). Used to keep the
+    subtotal-collapse from firing on numerically-coincident but unrelated lines."""
+    aa = "".join(ch for ch in a.lower() if ch.isalpha())
+    bb = "".join(ch for ch in b.lower() if ch.isalpha())
+    if len(aa) < n or len(bb) < n:
+        return False
+    return any(aa[i:i + n] in bb for i in range(len(aa) - n + 1))
+
+
 def _dedupe_components(df, components, y0, yN):
     """
     Remove redundant rows from a component list so the parts genuinely
@@ -1272,7 +1284,14 @@ def _dedupe_components(df, components, y0, yN):
     if drop:
         components = [c for c in components if c["name"] not in drop]
 
-    # 3. drop a component equal to the sum of >=2 others (a leaked subtotal)
+    # 3. drop a component equal to the sum of a SUBSET (2-3) of the other
+    #    components AND in the same naming family - a leaked subtotal nested among
+    #    siblings, e.g. a "Receivables" total next to the "Accounts Receivable" +
+    #    "Other Receivables" it contains. Keep the granular parts, drop the
+    #    redundant subtotal so it isn't double-counted. The shared-stem guard stops
+    #    an unrelated line (say Cash) being dropped because it happens to equal the
+    #    sum of two others by coincidence.
+    from itertools import combinations
     names = [c["name"] for c in components]
     drop2 = set()
     for c in components:
@@ -1280,18 +1299,24 @@ def _dedupe_components(df, components, y0, yN):
         yrs = list(s.index)
         if len(yrs) < 2:
             continue
-        others = [series[n] for n in names if n != c["name"] and n not in drop2]
-        if len(others) < 2:
-            continue
-        total, used = None, 0
-        for s2 in others:
-            if set(yrs).issubset(set(s2.index)):
-                total = s2[yrs] if total is None else total + s2[yrs]
-                used += 1
-        if total is not None and used >= 2:
-            scale = s[yrs].abs().max() or 1.0
-            if bool(((s[yrs] - total).abs() <= 0.005 * scale).all()):
-                drop2.add(c["name"])
+        scale = s[yrs].abs().max() or 1.0
+        others = [(n, series[n]) for n in names
+                  if n != c["name"] and n not in drop2 and set(yrs).issubset(set(series[n].index))]
+        matched = False
+        for k in (2, 3):
+            if matched:
+                break
+            for combo in combinations(others, k):
+                total = None
+                for _n, s2 in combo:
+                    total = s2[yrs] if total is None else total + s2[yrs]
+                if (total is not None
+                        and bool(((s[yrs] - total).abs() <= 0.005 * scale).all())
+                        and all(_shared_stem(c["name"], nm) for nm, _ in combo)):
+                    matched = True
+                    break
+        if matched:
+            drop2.add(c["name"])
     if drop2:
         components = [c for c in components if c["name"] not in drop2]
     return components
