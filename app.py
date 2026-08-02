@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02g watchlist"
+APP_BUILD = "2026-08-02h valuation history + dividends"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -507,6 +507,30 @@ def _find_price_series(node):
     if len(dated) >= 2 and str(dated[0][0]) > str(dated[-1][0]):
         best = list(reversed(best))
     return best
+
+
+def get_price_history(ticker):
+    """The full ascending [(date, close), ...] daily price series, for historical
+    valuation bands. Cached 6h. Empty list on failure."""
+    return _memo(("phist", ticker), lambda: _load_price_history(ticker),
+                 lambda r: bool(r))
+
+
+def _load_price_history(ticker):
+    url = f"{BASE}/quote/{_exchange_of(ticker)}/{ticker}/history/__data.json"
+    raw = _fetch(url)
+    if raw is None:
+        return []
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return []
+    for n in obj.get("nodes", []):
+        if isinstance(n, dict) and isinstance(n.get("data"), list):
+            s = _find_price_series(_resolve(n["data"]))
+            if s:
+                return s
+    return []
 
 
 def get_price(ticker):
@@ -2221,6 +2245,148 @@ def _data_flags(p):
     return flags
 
 
+def _row_by_year(df, *names):
+    """One statement line as {calendar_year:int -> value}, dropping non-numeric."""
+    s = _pick(df, *names)
+    if s is None:
+        return {}
+    out = {}
+    for col, val in s.items():
+        if not _fnum(val):
+            continue
+        try:
+            y = int(str(col)[:4])
+        except Exception:
+            continue
+        out[y] = float(val)
+    return out
+
+
+def _price_in_year(series, year, mult=1.0):
+    """Last close within `year` (or the most recent close before it) from an
+    ascending (date, close) series, scaled by `mult`. None if dates aren't year-
+    parseable or nothing is on/before that year."""
+    best = None
+    for d, c in series:
+        try:
+            y = int(str(d)[:4])
+        except Exception:
+            return None
+        if y <= year and _fnum(c):
+            best = c * mult
+        elif y > year:
+            break
+    return best
+
+
+def _pctile(cur, vals):
+    """Fraction of history at or below `cur` (0=cheapest end, 1=dearest)."""
+    xs = [v for v in vals if _fnum(v)]
+    if not xs or not _fnum(cur):
+        return None
+    return sum(1 for v in xs if v <= cur) / len(xs)
+
+
+def valuation_history(income, balance, cashflow, price_series, fx,
+                      cur_price, cur_eps, cur_bvps, cur_dps):
+    """Per-year P/E, P/B and dividend yield versus today, so a stock can be judged
+    against its OWN valuation history. Returns {} if the pieces aren't there."""
+    if not price_series or len(price_series) < 40:
+        return {}
+    # One currency multiplier for every historical close (the listing currency
+    # doesn't change): infer 1 vs fx from where today's price sits.
+    raw_last = price_series[-1][1]
+    mult = 1.0
+    if _fnum(cur_price) and _fnum(raw_last) and raw_last > 0:
+        mult = fx if (cur_price / raw_last) > 10 else 1.0
+
+    ni  = _row_by_year(income, "Net Income to Common", "Net Income")
+    eq  = _row_by_year(balance, "Total Common Equity", "Shareholders' Equity")
+    dvd = _row_by_year(cashflow, "Common Dividends Paid")
+    shy = (_row_by_year(income, "Shares Outstanding (Basic)", "Basic Shares Outstanding")
+           or _row_by_year(balance, "Total Common Shares Outstanding"))
+    years = sorted(y for y in ni if y in shy and shy[y] > 0)
+
+    pe, pb, dy = {}, {}, {}
+    for y in years:
+        px = _price_in_year(price_series, y, mult)
+        if not _fnum(px) or px <= 0:
+            continue
+        sh = shy[y]
+        eps_y = ni[y] / sh
+        if eps_y > 0:
+            pe[y] = px / eps_y
+        if y in eq and eq[y] > 0:
+            pb[y] = px / (eq[y] / sh)
+        if y in dvd and dvd[y]:
+            dy[y] = (abs(dvd[y]) / sh) / px
+
+    def stat(hist, cur, higher_is_cheaper=False):
+        vals = list(hist.values())
+        if len(vals) < 3 or not _fnum(cur):
+            return None
+        med = _median(vals)
+        p = _pctile(cur, vals)
+        if higher_is_cheaper and p is not None:
+            p = 1 - p              # for yield, a high value = cheap
+        return {"current": cur, "median": med, "low": min(vals), "high": max(vals),
+                "cheap_pctile": p, "series": hist, "n": len(vals)}
+
+    cur_yield = (cur_dps / cur_price) if (_fnum(cur_dps) and _fnum(cur_price) and cur_price > 0) else None
+    return {
+        "pe": stat(pe, cur_eps and cur_price and _safe_div(cur_price, cur_eps)),
+        "pb": stat(pb, cur_bvps and cur_price and _safe_div(cur_price, cur_bvps)),
+        "yield": stat(dy, cur_yield, higher_is_cheaper=True),
+        "mult": mult,
+    }
+
+
+def dividend_history(cashflow, income):
+    """Multi-year dividend-per-share record: streak of rises, cuts, growth and how
+    many of the last years paid. Returns {} if no dividend data."""
+    dvd = _row_by_year(cashflow, "Common Dividends Paid")
+    shy = (_row_by_year(income, "Shares Outstanding (Basic)", "Basic Shares Outstanding")
+           or {})
+    if not dvd:
+        return {}
+    dps = {}
+    for y, v in dvd.items():
+        sh = shy.get(y)
+        if _fnum(sh) and sh > 0:
+            dps[y] = abs(v) / sh
+    years = sorted(dps)
+    if len(years) < 2:
+        return {}
+    vals = [dps[y] for y in years]
+
+    paid = sum(1 for v in vals if v > 0)
+    # current streak of consecutive year-on-year rises (from the latest year back)
+    streak = 0
+    for i in range(len(vals) - 1, 0, -1):
+        if vals[i] > vals[i - 1] * 1.001:
+            streak += 1
+        else:
+            break
+    cuts = [years[i] for i in range(1, len(vals))
+            if vals[i] < vals[i - 1] * 0.999 and vals[i - 1] > 0]
+    pos = [v for v in vals if v > 0]
+    cagr = ((pos[-1] / pos[0]) ** (1 / (len(pos) - 1)) - 1) if len(pos) >= 2 and pos[0] > 0 else None
+
+    if paid == len(years) and not cuts and streak >= 3:
+        verdict = ("good", f"Paid every year on record and raised for {streak} years "
+                   "running - a dependable grower.")
+    elif cuts:
+        verdict = ("caution", f"Paid in {paid} of {len(years)} years, but cut in "
+                   + ", ".join(str(c) for c in cuts[-2:]) + " - not a steady grower.")
+    elif paid == len(years):
+        verdict = ("good", f"Paid in every one of the last {len(years)} years.")
+    else:
+        verdict = ("caution", f"Paid in {paid} of the last {len(years)} years - "
+                   "irregular.")
+    return {"series": {y: dps[y] for y in years}, "streak": streak, "cuts": cuts,
+            "cagr": cagr, "paid": paid, "years": len(years), "verdict": verdict}
+
+
 def _pct(x):
     return "-" if not _fnum(x) else "{:.1f}%".format(x * 100)
 
@@ -3386,6 +3552,108 @@ def render_momentum(ticker, currency):
                "a year earlier and the full trailing year.")
 
 
+def _band_metric(col, label, stat, fmtfn, cheap_when_below):
+    """Render one 'now vs its own history' metric; return a (label, kind, read)
+    summary tuple for the caption line, or None."""
+    if not stat or not _fnum(stat.get("current")):
+        col.metric(label, "-")
+        return None
+    cur, med = stat["current"], stat["median"]
+    delta = None
+    if _fnum(cur) and _fnum(med) and med > 0:
+        delta = f"{(cur/med - 1)*100:+.0f}% vs median"
+    col.metric(label, fmtfn(cur), delta, delta_color="off",
+               help=f"Median {fmtfn(med)}, range {fmtfn(stat['low'])}-"
+                    f"{fmtfn(stat['high'])} over {stat['n']} years.")
+    if not (_fnum(cur) and _fnum(med) and med > 0):
+        return None
+    ratio = cur / med
+    cheap = (ratio < 0.9) if cheap_when_below else (ratio > 1.1)
+    rich = (ratio > 1.1) if cheap_when_below else (ratio < 0.9)
+    kind = "good" if cheap else "caution" if rich else "neutral"
+    word = "cheaper than usual" if cheap else "dearer than usual" if rich else "about typical"
+    return (label, kind, f"{label} is {word}")
+
+
+def render_history(income, balance, cashflow, currency, ticker):
+    """History tab: valuation versus the company's own past, and its dividend record."""
+    st.subheader("Valuation history & dividend record")
+    st.caption("A stock is cheap or dear relative to its OWN past, not just in the "
+               "abstract. This maps today's multiples onto their history and shows "
+               "the multi-year dividend record.")
+    inc_a, bal_a, cf_a = _align_to_complete_years(income, balance, cashflow)
+    ctype = detect_company_type(inc_a, bal_a)
+    p = build_metric_panel(inc_a, bal_a, cf_a, ctype)
+    r = intrinsic_valuation(inc_a, bal_a, cf_a, p, get_ratios(ticker), ctype,
+                            0.12, 0.02, currency, ticker, 0.25, quote=get_price(ticker))
+    fx = (_FX_CONTEXT.get(ticker, {}) or {}).get("rate") or 1.0
+    series = get_price_history(ticker)
+    vh = valuation_history(inc_a, bal_a, cf_a, series, fx, r.get("price"),
+                           r.get("eps"), r.get("bvps"), r.get("dps"))
+    cur = currency or "JMD"
+
+    def fx_(x):
+        return "-" if not _fnum(x) else f"{x:.1f}x"
+
+    def fy_(x):
+        return "-" if not _fnum(x) else f"{x*100:.1f}%"
+
+    st.markdown("#### Valuation vs its own history")
+    if not vh or not any(vh.get(k) for k in ("pe", "pb", "yield")):
+        st.info("Not enough overlapping price history and annual data to build "
+                "valuation bands for this company (needs a few years of both).")
+    else:
+        cols = st.columns(3)
+        reads = [
+            _band_metric(cols[0], "P/E", vh.get("pe"), fx_, True),
+            _band_metric(cols[1], "P/B", vh.get("pb"), fx_, True),
+            _band_metric(cols[2], "Dividend yield", vh.get("yield"), fy_, False),
+        ]
+        good = [rd for rd in reads if rd and rd[1] == "good"]
+        rich = [rd for rd in reads if rd and rd[1] == "caution"]
+        if good:
+            st.markdown("<span style='color:#1a7f37'>Versus its own history, "
+                        + ", ".join(rd[0] for rd in good) + " look cheap.</span>",
+                        unsafe_allow_html=True)
+        if rich:
+            st.markdown("<span style='color:#9a6700'>" + ", ".join(rd[0] for rd in rich)
+                        + " sit above their historical norm.</span>",
+                        unsafe_allow_html=True)
+        pe = vh.get("pe")
+        if pe and len(pe.get("series", {})) >= 3:
+            s = pd.Series(pe["series"])
+            s.index = [str(y) for y in s.index]
+            st.plotly_chart(line_chart(s, "P/E by year", "P/E"),
+                            use_container_width=True)
+        st.caption(f"Multiples are each year-end price against that year's reported "
+                   f"figures ({vh.get('pe', {}).get('n', '?')} years). Companies with "
+                   "a non-December year-end are matched to the calendar year, so "
+                   "treat the bands as indicative.")
+
+    st.divider()
+    st.markdown("#### Dividend track record")
+    dh = dividend_history(cf_a, inc_a)
+    if not dh:
+        st.info("No multi-year dividend-per-share record is available for this company.")
+    else:
+        kind, txt = dh["verdict"]
+        col = {"good": "#1a7f37", "caution": "#9a6700"}.get(kind, "#57606a")
+        bg = {"good": "#dafbe1", "caution": "#fff8c5"}.get(kind, "#eaeef2")
+        st.markdown("<div style='margin:6px 0;padding:12px 16px;border-radius:10px;"
+                    "background:" + bg + ";border:1px solid " + col + "44'>"
+                    "<b style='color:" + col + "'>" + txt + "</b></div>",
+                    unsafe_allow_html=True)
+        dc = st.columns(4)
+        dc[0].metric("Years paid", f"{dh['paid']} / {dh['years']}")
+        dc[1].metric("Rising streak", f"{dh['streak']} yrs")
+        dc[2].metric("Cuts on record", str(len(dh["cuts"])))
+        dc[3].metric("Dividend CAGR", fy_(dh["cagr"]))
+        s = pd.Series(dh["series"])
+        s.index = [str(y) for y in s.index]
+        st.plotly_chart(bar_chart(s, "Dividend per share by year", cur),
+                        use_container_width=True)
+
+
 def render_valuation(income, balance, cashflow, currency, ticker,
                      discount, term_g, mos, asset_life=0, residual_pct=0.0,
                      recovery=None):
@@ -4201,7 +4469,8 @@ def main():
         )
 
     tabs = st.tabs(["Overview", "Verdict", "Income Statement", "Balance Sheet",
-                    "Cash Flow", "Decomposition", "Ratios", "Valuation", "Momentum"])
+                    "Cash Flow", "Decomposition", "Ratios", "Valuation", "Momentum",
+                    "History"])
 
     # ---- Overview ---------------------------------------------------------
     with tabs[0]:
@@ -4411,6 +4680,10 @@ def main():
     # ---- Momentum (quarterly / TTM) --------------------------------------
     with tabs[8]:
         render_momentum(ticker, currency)
+
+    # ---- History (valuation bands + dividend record) ---------------------
+    with tabs[9]:
+        render_history(income, balance, cashflow, currency, ticker)
 
 
 if __name__ == "__main__":
