@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02b quote-currency fix"
+APP_BUILD = "2026-08-02c implied-growth + value labels"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -1643,6 +1643,63 @@ def finite_pv(base, g1, term_g, discount, years, residual=0.0):
     return pv
 
 
+def implied_growth(base_ps, price, term_g, discount, finite=False, years=10, residual=0.0):
+    """Reverse DCF: solve for the stage-1 growth rate the CURRENT price implies,
+    holding the discount rate and terminal growth fixed. Present value rises with
+    growth, so a simple bisection inverts it. Returns (status, g):
+      'solved' -> g is the growth the price bakes in;
+      'below'  -> the price is covered even if the cash flows shrink;
+      'above'  -> even the search ceiling won't justify the price."""
+    if not (_fnum(base_ps) and base_ps > 0 and _fnum(price) and price > 0
+            and _fnum(discount)):
+        return None
+    yrs = int(years) if (finite and years) else 10
+
+    def pv(g):
+        return (finite_pv(base_ps, g, term_g, discount, yrs, residual) if finite
+                else two_stage_pv(base_ps, g, term_g, discount, years=10))
+
+    lo, hi = -0.30, 0.60
+    plo, phi = pv(lo), pv(hi)
+    if not (_fnum(plo) and _fnum(phi)):
+        return None
+    if price <= plo:
+        return ("below", lo)
+    if price >= phi:
+        return ("above", hi)
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        (lo, hi) = (mid, hi) if pv(mid) < price else (lo, mid)
+    return ("solved", 0.5 * (lo + hi))
+
+
+def growth_reasonableness(g_impl, p):
+    """Judge the price-implied growth against what the business has delivered.
+    Returns (kind, delivered_rate, sentence)."""
+    hist = [g for g in (p.get("niCagr"), p.get("revCagr")) if _fnum(g)]
+    d = max(hist) if hist else None
+    if not _fnum(g_impl):
+        return ("neutral", d, "")
+    if d is not None:
+        if g_impl <= max(d, 0.0) - 0.005:
+            return ("good", d, "That is LESS than the business has actually delivered, "
+                    "so the price is not demanding heroics - it leaves room to be "
+                    "positively surprised.")
+        if g_impl <= d + 0.03 and g_impl <= 0.15:
+            return ("good", d, "That is roughly in line with what it has delivered - a "
+                    "reasonable bar to clear.")
+        if g_impl <= 0.20:
+            return ("caution", d, "That is above its track record - achievable only if "
+                    "growth accelerates from here.")
+        return ("bad", d, "That is faster than the business has ever sustained - the "
+                "price is leaning on optimistic expectations.")
+    if g_impl <= 0.08:
+        return ("good", None, "a modest bar in absolute terms.")
+    if g_impl <= 0.15:
+        return ("neutral", None, "a moderate bar; there is limited history to judge it.")
+    return ("caution", None, "a demanding bar, with little history to support it.")
+
+
 # Default recovery rates for a liquidation/salvage estimate - the fraction of
 # each asset's reported book value a seller could realistically recover, net of
 # ALL liabilities at 100%. Roughly Graham/Buffett conventions; user-adjustable.
@@ -3175,6 +3232,61 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                            "leaning hard on assumptions - lean more on the "
                            "book-value, dividend and Graham methods instead.")
 
+    # ---- What the price is assuming (reverse DCF) -------------------------
+    base_ps = None
+    base_label = ""
+    if _fnum(r.get("oeps")) and r["oeps"] > 0:
+        base_ps, base_label = r["oeps"], "owner earnings"
+    elif _fnum(r.get("dps")) and r["dps"] > 0:
+        base_ps, base_label = r["dps"], "dividends"
+    elif _fnum(r.get("fcfps")) and r["fcfps"] > 0:
+        base_ps, base_label = r["fcfps"], "free cash flow"
+    if _fnum(r.get("price")) and _fnum(base_ps):
+        finite = bool(r.get("asset_life"))
+        yrs = r.get("asset_life") or 10
+        ig = implied_growth(base_ps, r["price"], term_g, discount,
+                            finite=finite, years=yrs)
+        st.markdown("#### What today's price is assuming")
+        st.caption(
+            "A reverse DCF: instead of guessing growth and getting a value, it "
+            "holds today's price fixed and solves for the growth the market must "
+            "be counting on - then checks that against what the business has done."
+        )
+        if ig is None:
+            st.caption("Not enough data to reverse-engineer the implied growth.")
+        elif ig[0] == "below":
+            st.markdown(
+                "<div style='color:#1a7f37'>The price is covered even if "
+                + base_label + " <b>shrink</b> from here - the market is pricing in "
+                "decline, so merely holding steady would be upside.</div>",
+                unsafe_allow_html=True)
+        elif ig[0] == "above":
+            st.markdown(
+                "<div style='color:#cf222e'>Even ~60%/yr growth would not justify "
+                "the price under these assumptions - either expectations are extreme, "
+                "or a cash-flow DCF is the wrong lens for this one (lean on the asset "
+                "and book-value methods).</div>", unsafe_allow_html=True)
+        else:
+            g_impl = ig[1]
+            kind, delivered, sentence = growth_reasonableness(g_impl, p)
+            col = {"good": "#1a7f37", "caution": "#9a6700",
+                   "bad": "#cf222e", "neutral": "#57606a"}.get(kind, "#57606a")
+            horizon = f"{int(yrs)} years" if finite else "the next decade"
+            st.markdown(
+                f"To justify today's price of **{money(r['price'])}**, {base_label} "
+                f"must grow about **{g_impl*100:.0f}% a year** for {horizon} "
+                f"(then {term_g*100:.0f}% thereafter)."
+            )
+            deliv_txt = (f"For comparison, it has delivered "
+                         f"{_pct(p.get('niCagr'))} earnings and "
+                         f"{_pct(p.get('revCagr'))} revenue growth (annualised).")
+            st.markdown(deliv_txt)
+            st.markdown("<div style='margin-top:4px;font-weight:600;color:" + col
+                        + "'>" + sentence + "</div>", unsafe_allow_html=True)
+        st.caption(f"Assumes discount {discount*100:.0f}%, terminal growth "
+                   f"{term_g*100:.0f}%" + (f", {int(yrs)}-yr life" if finite else "")
+                   + f", on {base_label} of {money(base_ps)}/share.")
+
     # ---- Asset backing & downside -----------------------------------------
     b = r.get("backing") or {}
     if b:
@@ -3289,12 +3401,28 @@ def build_universe():
                 return round(x * 100, 1) if isinstance(x, (int, float)) else None
             def num(x, nd=2):
                 return round(x, nd) if isinstance(x, (int, float)) else None
+
+            # Fair-value read at fixed, screen-wide assumptions (so it stays cached
+            # and comparable across the whole exchange).
+            rv = intrinsic_valuation(income, balance, cash, p, get_ratios(tkr),
+                                     a["ctype"], 0.12, 0.02, "JMD", tkr, 0.25,
+                                     quote=None)
+            up = rv.get("upside")
+            if isinstance(up, (int, float)):
+                value_lbl = ("Undervalued" if up >= 0.25 else
+                             "Overvalued" if up <= -0.20 else "Around fair")
+            else:
+                value_lbl = "—"
             rows.append({
                 "Ticker": tkr,
                 "Company": name,
                 "Type": a["typeLabel"],
                 "Score": a["overall"],
                 "Band": a["band"],
+                "Value": value_lbl,
+                "Upside %": pct(up),
+                "Fair value": num(rv.get("central")),
+                "Price": num(rv.get("price")),
                 "ROE %": pct(p.get("roe")),
                 "Op margin %": pct(p.get("opMargin")),
                 "Net margin %": pct(p.get("netMargin")),
@@ -3331,8 +3459,9 @@ def render_compare():
         investible = c1.checkbox("Investible universe only (score > 70)", value=True)
         types = c2.multiselect("Industry / type", sorted(uni["Type"].unique()))
         sort_by = c3.selectbox("Rank by", [
-            "Score", "ROE %", "Op margin %", "Net margin %", "FCF margin %",
-            "Rev CAGR %", "Interest cover", "Net debt/EBIT (low to high)",
+            "Upside %", "Score", "ROE %", "Op margin %", "Net margin %",
+            "FCF margin %", "Rev CAGR %", "Interest cover",
+            "Net debt/EBIT (low to high)",
         ])
 
         view = uni.copy()
@@ -3345,8 +3474,20 @@ def render_compare():
         key = sort_by.split(" (")[0].strip()
         view = view.sort_values(key, ascending=ascending, na_position="last")
 
-        st.caption(f"{len(view)} companies match.")
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.caption(f"{len(view)} companies match. \"Value\" compares price to a "
+                   "blended fair value at fixed screen assumptions (12% discount, "
+                   "2% terminal growth, 25% margin of safety) - a first pass, not a "
+                   "substitute for the per-company Valuation tab.")
+        _vcolor = {"Undervalued": "#dafbe1", "Overvalued": "#ffebe9",
+                   "Around fair": "#fff8c5"}
+
+        def _style_screen(df):
+            sty = df.style
+            if "Value" in df.columns:
+                sty = sty.map(lambda v: f"background-color:{_vcolor.get(v, '')}",
+                              subset=["Value"])
+            return sty
+        st.dataframe(_style_screen(view), use_container_width=True, hide_index=True)
         st.download_button("Download as CSV", view.to_csv(index=False),
                            "jse_screen.csv", "text/csv")
 
