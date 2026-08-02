@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02o per-share xray + ratios current"
+APP_BUILD = "2026-08-02p signal-check table"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -2055,48 +2055,89 @@ def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
                   ("Net income (EPS)", p.get("ni")),
                   ("Free cash flow", p.get("fcf"))] if _fnum(v)]
 
-    # --- Rigorous signals ---------------------------------------------------
+    # --- Vetted signal checks ----------------------------------------------
+    # Each consequential per-share figure vs the price, with an explicit verdict
+    # and the reasoning - so a figure that merely sits above/below the price is
+    # explained rather than silently (mis)read as cheap.
     net_cash_ps = ps(cash - debt)
     ncav_ps = ps(curassets - total_liab) if (_fnum(curassets) and _fnum(total_liab)) else None
     book_ps = ps(equity)
     rev_ps = ps(p.get("rev"))
+    recv_ps = ps(recv)
+    liab_ps_val = ps(total_liab)
     nm = p.get("netMargin")
     fin = ctype in ("reit", "bank", "insurer", "holding")
+    above = (lambda v: _fnum(v) and _fnum(price) and price > 0 and v >= price)
 
-    signals, notes = [], []
-    if _fnum(price) and price > 0:
-        if _fnum(net_cash_ps) and net_cash_ps >= price:
-            signals.append(("strong", f"Price is at or below **net cash per share** "
-                            f"({net_cash_ps:,.2f}) - the market is valuing the whole "
-                            "operating business at zero or less."))
-        elif _fnum(ncav_ps) and ncav_ps >= price:
-            signals.append(("strong", f"Price is at or below **net current asset value** "
-                            f"({ncav_ps:,.2f}) - current assets alone, net of ALL "
-                            "liabilities, exceed the price (a Graham net-net)."))
-        if _fnum(book_ps) and book_ps >= price:
-            if fin:
-                signals.append(("moderate", f"Price is below **book value** "
-                                f"({book_ps:,.2f}), which for this kind of company is "
-                                "close to net asset value - a real discount to NAV."))
-            else:
-                signals.append(("weak", f"Price is below **book value** ({book_ps:,.2f}, "
-                                "P/B < 1). Book here is historical cost, so confirm the "
-                                "assets are productive before calling it cheap."))
-        if _fnum(rev_ps) and rev_ps >= price:
-            if _fnum(nm) and nm >= 0.08:
-                signals.append(("moderate", f"Price is below **annual revenue per share** "
-                                f"({rev_ps:,.2f}) on a healthy {nm*100:.0f}% net margin "
-                                f"(P/S {price/rev_ps:.2f}) - a low sales multiple on a "
-                                "genuinely profitable business."))
-            else:
-                notes.append("Revenue per share is above the price (P/S < 1), but the "
-                             "net margin is thin, so a low sales multiple is normal "
-                             "here - not a reliable signal on its own.")
+    checks = []
+
+    def chk(label, val, status, why):
+        if _fnum(val):
+            checks.append({"label": label, "val": val, "status": status, "why": why})
+
+    if above(net_cash_ps):
+        chk("Net cash / share", net_cash_ps, "strong",
+            "Cash minus ALL debt already exceeds the price - you'd be getting the "
+            "operating business for free (or be paid to take it). The strongest "
+            "asset-based signal there is.")
+    else:
+        chk("Net cash / share", net_cash_ps, "none",
+            "Below the price, which is normal - a healthy business is worth more than "
+            "its spare cash. Only a signal when it rises above the price.")
+
+    if above(ncav_ps):
+        chk("Net current assets (net-net) / share", ncav_ps, "strong",
+            "Current assets net of EVERY liability still exceed the price - Graham's "
+            "net-net, a hard liquidation floor. This is the rigorous version of "
+            "'assets vs price': it already subtracts all debt.")
+    elif _fnum(ncav_ps):
+        chk("Net current assets (net-net) / share", ncav_ps, "none",
+            "Below the price. This already nets off all liabilities, so it - not raw "
+            "receivables or inventory - is the honest 'assets vs price' test.")
+
+    if above(book_ps):
+        if fin:
+            chk("Book value (~ NAV) / share", book_ps, "moderate",
+                "For a bank, insurer or property company book value is close to net "
+                "asset value, so trading below it is a genuine discount to NAV.")
+        else:
+            chk("Book value / share", book_ps, "weak",
+                "P/B below 1, but book is historical cost - a below-book industrial "
+                "can be cheap OR a value trap. Confirm the assets actually earn.")
+    elif _fnum(book_ps):
+        chk("Book value / share", book_ps, "none",
+            "Below the price (P/B > 1) - no discount to book here.")
+
+    if above(rev_ps):
+        if _fnum(nm) and nm >= 0.08:
+            chk("Revenue / share", rev_ps, "moderate",
+                f"Price is under a year's sales (P/S {price/rev_ps:.2f}) AND the "
+                f"business earns a real {nm*100:.0f}% net margin - a low sales multiple "
+                "on genuine profit, which is worth a look.")
+        else:
+            chk("Revenue / share", rev_ps, "none",
+                "Price is under a year's sales (P/S < 1), BUT the net margin is thin - "
+                "low-margin businesses routinely trade below sales, so on its own this "
+                "is not a signal.")
+    elif _fnum(rev_ps):
+        chk("Revenue / share", rev_ps, "none",
+            "Price is ABOVE a year's sales (P/S > 1). That is the expensive direction - "
+            "revenue sitting below the price is not a cheapness signal.")
+
+    if _fnum(recv_ps):
+        chk("Receivables / share", recv_ps, "context",
+            "A single asset line. Whether it's above or below the price says nothing on "
+            "its own - it only counts net of all liabilities, which the net-current-"
+            "assets check above already does.")
+    if _fnum(liab_ps_val):
+        chk("All liabilities / share", liab_ps_val, "context",
+            "What the company OWES, shown for scale - not value it holds. Liabilities "
+            "below the price is not a signal; what matters is assets NET of these.")
+
     return {
         "assets": assets_ps, "assets_total": ps(assets),
         "liab": liab_ps, "book_ps": book_ps,
-        "income": income_ps, "signals": signals, "notes": notes,
-        "price": price,
+        "income": income_ps, "checks": checks, "price": price,
     }
 
 
@@ -4500,17 +4541,24 @@ def render_valuation(income, balance, cashflow, currency, ticker,
             rows = []
             for lbl, v in items:
                 pctp = (f"{v/price*100:,.0f}%" if (_fnum(v) and _fnum(price) and price > 0) else "-")
-                above = _fnum(v) and _fnum(price) and v >= price
-                rows.append({"Line": ("● " if above else "") + lbl,
-                             "Per share": money(v), "% of price": pctp})
+                rows.append({"Line": lbl, "Per share": money(v), "% of price": pctp,
+                             "_v": v if _fnum(v) else None})
             if total is not None and _fnum(total):
                 rows.append({"Line": "Total", "Per share": money(total),
                              "% of price": (f"{total/price*100:,.0f}%"
-                                            if _fnum(price) and price > 0 else "-")})
-            if rows:
-                st.markdown(f"**{title}**")
-                st.dataframe(pd.DataFrame(rows), hide_index=True,
-                             use_container_width=True)
+                                            if _fnum(price) and price > 0 else "-"),
+                             "_v": total})
+            if not rows:
+                return
+            df = pd.DataFrame(rows)
+
+            def _hl(row):
+                over = (_fnum(price) and price > 0 and _fnum(row["_v"])
+                        and row["_v"] >= price)
+                return ["background-color:#fff3cd" if over else ""] * len(row)
+            st.markdown(f"**{title}**")
+            st.dataframe(df.style.apply(_hl, axis=1).hide(axis="columns", subset=["_v"]),
+                         hide_index=True, use_container_width=True)
 
         xc = st.columns(2)
         with xc[0]:
@@ -4519,24 +4567,40 @@ def render_valuation(income, balance, cashflow, currency, ticker,
         with xc[1]:
             _tbl("Income / share (per year)", xr["income"])
             if _fnum(xr.get("book_ps")):
-                st.markdown("**Equity / share**")
-                st.dataframe(pd.DataFrame([{"Line": "Book value", "Per share":
-                            money(xr["book_ps"]), "% of price":
-                            (f"{xr['book_ps']/price*100:,.0f}%" if _fnum(price) and price > 0 else "-")}]),
-                            hide_index=True, use_container_width=True)
-        st.caption("● marks a line whose per-share value sits at or above the price.")
+                _tbl("Equity / share", [("Book value", xr["book_ps"])])
+        st.caption("Amber-highlighted rows sit at or above the price. That alone is "
+                   "**not** cheapness - the vetted check below says which comparisons "
+                   "actually count, and why.")
 
-        if xr["signals"]:
-            st.markdown("**What actually signals undervaluation here:**")
-            _sc = {"strong": "#1a7f37", "moderate": "#1a7f37", "weak": "#9a6700"}
-            for kind, txt in xr["signals"]:
-                st.markdown("<div style='margin:4px 0;color:" + _sc.get(kind, "#57606a")
-                            + "'>• " + txt + "</div>", unsafe_allow_html=True)
-        else:
-            st.caption("No net-of-liabilities or margin-backed undervaluation signal "
-                       "is present at the current price.")
-        for note in xr.get("notes", []):
-            st.caption("Note: " + note)
+        # ---- Signal check: what counts, and why --------------------------
+        checks = xr.get("checks") or []
+        if checks:
+            st.markdown("**Signal check - what counts, and why**")
+            _bg = {"strong": "#dafbe1", "moderate": "#dafbe1", "weak": "#fff8c5",
+                   "none": "#f6f8fa", "context": "#eef1f4"}
+            _lab = {"strong": "STRONG signal", "moderate": "Signal",
+                    "weak": "Weak / caveated", "none": "Not a signal",
+                    "context": "Context only"}
+            crows = [{
+                "Comparison": c["label"],
+                "Per share": money(c["val"]),
+                "vs price": ("above" if (_fnum(price) and price > 0 and c["val"] >= price)
+                             else "below"),
+                "Verdict": _lab.get(c["status"], c["status"]),
+                "Why": c["why"],
+                "_s": c["status"],
+            } for c in checks]
+            cdf = pd.DataFrame(crows)
+
+            def _hlc(row):
+                return [f"background-color:{_bg.get(row['_s'], '')}"] * len(row)
+            st.dataframe(cdf.style.apply(_hlc, axis=1).hide(axis="columns", subset=["_s"]),
+                         hide_index=True, use_container_width=True)
+            st.caption("Green = a genuine undervaluation signal; yellow = real but "
+                       "caveated; grey = considered and explicitly not a signal (with "
+                       "the reason). This is why revenue, receivables or liabilities "
+                       "sitting either side of the price don't move the needle on "
+                       "their own.")
 
     # ---- Why these methods -------------------------------------------------
     with st.expander("Why these methods - and why they have lasted"):
