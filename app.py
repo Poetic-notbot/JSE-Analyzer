@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02q liquidation test"
+APP_BUILD = "2026-08-02r type-aware asset checks"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -118,8 +118,11 @@ PRIMARY_TOTAL = {
 # per-share and valuation figures make sense). This is a small curated list; if a
 # company is missing it is simply treated as already-JMD.
 USD_REPORTERS = {
-    "TJH", "GHL", "PROVEN", "SGJ", "SCIUSD", "FIRSTROCKUSD",
-    "MASSY", "SRFUSD", "SILUS", "PULS", "TJHUSD", "SELECTMD",
+    "TJH", "GHL", "PROVEN", "SCIUSD", "FIRSTROCKUSD",
+    "SRFUSD", "SILUS", "TJHUSD", "SELECTMD",
+    # NB: SGJ (Scotia Group Jamaica) reports in JMD - do not add it here, or every
+    # figure gets multiplied by the USD/JMD rate. MASSY (TTD) and PULS were also
+    # removed pending verification of their reporting currency.
 }
 DEFAULT_USD_JMD = 158.0  # rough fallback rate; only used for USD reporters
 
@@ -2067,6 +2070,10 @@ def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
     liab_ps_val = ps(total_liab)
     nm = p.get("netMargin")
     fin = ctype in ("reit", "bank", "insurer", "holding")
+    # A deposit-taking bank / insurer: net-net, 'cash less all liabilities', NCAV and
+    # P/S are meaningless (its liabilities are deposits/reserves; its 'revenue' is
+    # interest/premium income). For those, only book value is a valid per-share check.
+    deposit_fin = ctype in ("bank", "insurer")
     above = (lambda v: _fnum(v) and _fnum(price) and price > 0 and v >= price)
 
     checks = []
@@ -2075,22 +2082,22 @@ def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
         if _fnum(val):
             checks.append({"label": label, "val": val, "status": status, "why": why})
 
-    if above(net_cash_ps):
+    if not deposit_fin and above(net_cash_ps):
         chk("Net cash / share", net_cash_ps, "strong",
             "Cash minus ALL debt already exceeds the price - you'd be getting the "
             "operating business for free (or be paid to take it). The strongest "
             "asset-based signal there is.")
-    else:
+    elif not deposit_fin:
         chk("Net cash / share", net_cash_ps, "none",
             "Below the price, which is normal - a healthy business is worth more than "
             "its spare cash. Only a signal when it rises above the price.")
 
-    if above(ncav_ps):
+    if not deposit_fin and above(ncav_ps):
         chk("Net current assets (net-net) / share", ncav_ps, "strong",
             "Current assets net of EVERY liability still exceed the price - Graham's "
             "net-net, a hard liquidation floor. This is the rigorous version of "
             "'assets vs price': it already subtracts all debt.")
-    elif _fnum(ncav_ps):
+    elif not deposit_fin and _fnum(ncav_ps):
         chk("Net current assets (net-net) / share", ncav_ps, "none",
             "Below the price. This already nets off all liabilities, so it - not raw "
             "receivables or inventory - is the honest 'assets vs price' test.")
@@ -2108,7 +2115,7 @@ def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
         chk("Book value / share", book_ps, "none",
             "Below the price (P/B > 1) - no discount to book here.")
 
-    if above(rev_ps):
+    if not deposit_fin and above(rev_ps):
         if _fnum(nm) and nm >= 0.08:
             chk("Revenue / share", rev_ps, "moderate",
                 f"Price is under a year's sales (P/S {price/rev_ps:.2f}) AND the "
@@ -2119,17 +2126,17 @@ def per_share_xray(income, balance, cashflow, p, shares, price, ctype):
                 "Price is under a year's sales (P/S < 1), BUT the net margin is thin - "
                 "low-margin businesses routinely trade below sales, so on its own this "
                 "is not a signal.")
-    elif _fnum(rev_ps):
+    elif not deposit_fin and _fnum(rev_ps):
         chk("Revenue / share", rev_ps, "none",
             "Price is ABOVE a year's sales (P/S > 1). That is the expensive direction - "
             "revenue sitting below the price is not a cheapness signal.")
 
-    if _fnum(recv_ps):
+    if not deposit_fin and _fnum(recv_ps):
         chk("Receivables / share", recv_ps, "context",
             "A single asset line. Whether it's above or below the price says nothing on "
             "its own - it only counts net of all liabilities, which the net-current-"
             "assets check above already does.")
-    if _fnum(liab_ps_val):
+    if not deposit_fin and _fnum(liab_ps_val):
         chk("All liabilities / share", liab_ps_val, "context",
             "What the company OWES, shown for scale - not value it holds. Liabilities "
             "below the price is not a signal; what matters is assets NET of these.")
@@ -4656,7 +4663,33 @@ def render_valuation(income, balance, cashflow, currency, ticker,
 
     # ---- Asset backing & downside -----------------------------------------
     b = r.get("backing") or {}
-    if b:
+    deposit_fin = ctype in ("bank", "insurer")
+    if b and deposit_fin:
+        # A bank/insurer's liabilities are customer deposits / policy reserves, not
+        # trade creditors - so net-net, liquidation and 'cash less all liabilities'
+        # are meaningless (they'd always be hugely negative). Book value is the anchor.
+        st.markdown("#### Asset backing (book value)")
+        price = r.get("price")
+        bk = b.get("bookPs")
+        c1, c2 = st.columns(2)
+        c1.metric("Book value (~ NAV) / share", money(bk))
+        if _fnum(bk) and _fnum(price) and bk > 0:
+            c2.metric("Price / book", f"{price/bk:.2f}x")
+        st.info(
+            "For a deposit-taking bank or insurer, net-net and liquidation measures "
+            "do **not** apply - its liabilities are customer deposits / policy "
+            "reserves, not trade creditors, so 'cash minus all liabilities' is "
+            "always deeply negative and says nothing about value. The right asset "
+            "anchor is **book value (equity) per share**, and such businesses are "
+            "valued on price-to-book against their return on equity (see the "
+            "methods above)."
+        )
+        if _fnum(bk) and _fnum(price) and price <= bk:
+            st.markdown("<div style='margin:4px 0;color:#1a7f37'>• Trading **below "
+                        "book value** - a genuine discount to net asset value for a "
+                        "financial, provided the loan/investment book is sound.</div>",
+                        unsafe_allow_html=True)
+    elif b:
         st.markdown("#### Asset backing & downside")
         st.caption(
             "What the assets alone are worth per share, net of ALL debt - the "
@@ -4792,9 +4825,11 @@ def render_valuation(income, balance, cashflow, currency, ticker,
                        "their own.")
 
         # ---- Conservative liquidation test (the rigorous asset check) ----
-        lt = liquidation_test(inc_a, bal_a, cf_a, p, r.get("shares"), r.get("price"),
-                              currency, recovery)
-        if lt and lt.get("level") != "na":
+        # Only for non-deposit businesses: on a bank/insurer the liabilities are
+        # deposits/reserves, so a liquidation/net-net view is meaningless.
+        lt = (liquidation_test(inc_a, bal_a, cf_a, p, r.get("shares"), r.get("price"),
+                               currency, recovery) if not deposit_fin else None)
+        if not deposit_fin and lt and lt.get("level") != "na":
             st.markdown("**Conservative liquidation test** - the rigorous version of "
                         "“price below its assets”")
             st.caption(
