@@ -57,7 +57,7 @@ import streamlit as st
 # Bump this whenever the data-fetching behaviour changes. It is shown in the
 # sidebar so it is unambiguous which build is actually running (a reboot that
 # doesn't change this string means the deployment is not on the latest commit).
-APP_BUILD = "2026-08-02d dividends + exch fallback"
+APP_BUILD = "2026-08-02e quarterly / TTM momentum"
 
 BASE = "https://stockanalysis.com"
 HEADERS = {
@@ -248,6 +248,28 @@ def _statement_segments(statement):
     return [STATEMENTS[statement]]
 
 
+def get_quarterly(ticker, statement):
+    """Cached wrapper for the quarterly view of a statement (up to ~12 quarters)."""
+    return _memo(("qtr", ticker, statement),
+                 lambda: _load_quarterly(ticker, statement),
+                 lambda r: r is not None and r[0] is not None, ttl_ok=60 * 60)
+
+
+def _load_quarterly(ticker, statement):
+    """Quarterly statement columns (period-end dated), for TTM and momentum. Same
+    page as the annual view with ?p=quarterly. Returns (df, aggregates, currency)
+    or (None, None, None)."""
+    for exch in _exchanges_for(ticker):
+        for seg in _statement_segments(statement):
+            url = (f"{BASE}/quote/{exch}/{ticker}/financials/{seg}"
+                   "__data.json?p=quarterly")
+            result = _parse_statement(_fetch(url), ticker, quarterly=True, max_cols=13)
+            if result[0] is not None:
+                _TICKER_EXCHANGE[ticker.upper()] = exch
+                return result
+    return None, None, None
+
+
 def _load_statement(ticker, statement):
     """
     Return one financial statement for a ticker as a tidy table.
@@ -276,9 +298,11 @@ def _load_statement(ticker, statement):
     return None, None, None
 
 
-def _parse_statement(raw, ticker):
+def _parse_statement(raw, ticker, quarterly=False, max_cols=6):
     """Turn one statement's raw __data.json text into (df, aggregates, currency),
-    or (None, None, None) if it is missing/unparseable/empty."""
+    or (None, None, None) if it is missing/unparseable/empty. For quarterly data
+    the fiscal year repeats across quarters, so columns are keyed by period-end
+    date instead, and more columns are kept."""
     if raw is None:
         return None, None, None
     try:
@@ -307,20 +331,25 @@ def _parse_statement(raw, ticker):
     if ticker.upper() in USD_REPORTERS:
         currency = "USD"
 
-    fiscal_years = fdata.get("fiscalYear") or fdata.get("datekey") or []
+    # Annual columns are identified by fiscal year; quarterly columns repeat the
+    # year, so use the unique period-end date instead.
+    if quarterly:
+        labels_src = fdata.get("datekey") or fdata.get("fiscalYear") or []
+    else:
+        labels_src = fdata.get("fiscalYear") or fdata.get("datekey") or []
 
-    # De-duplicate restatement columns that repeat a fiscal year, and drop TTM
-    # so trends are clean annual figures.
-    keep_cols, seen_years = [], set()
-    for i, yr in enumerate(fiscal_years):
+    # De-duplicate restatement columns and drop TTM so trends are clean.
+    keep_cols, seen = [], set()
+    for i, yr in enumerate(labels_src):
         if str(yr).upper() == "TTM":
             continue
-        if yr in seen_years:
+        if yr in seen:
             continue
-        seen_years.add(yr)
+        seen.add(yr)
         keep_cols.append(i)
-    keep_cols = keep_cols[:6]                       # most recent 6 years max
-    year_labels = [str(fiscal_years[i]) for i in keep_cols][::-1]  # oldest->newest
+    keep_cols = keep_cols[:max_cols]                # most recent columns
+    year_labels = [str(labels_src[i]) for i in keep_cols][::-1]  # oldest->newest
+    fiscal_years = labels_src
 
     rows, aggregates = {}, set()
     for entry in layout:
@@ -3203,6 +3232,160 @@ _VAL_BAND_BG = {
 }
 
 
+def _qseries(df, *names):
+    for nm in names:
+        if df is not None and nm in df.index:
+            s = clean_series(df, nm)
+            if len(s):
+                return s
+    return pd.Series(dtype=float)
+
+
+def quarterly_momentum(qinc, qbal, qcf, fx=1.0):
+    """Trailing-twelve-month figures and momentum from quarterly data. Compares the
+    latest TTM to the year-before TTM and the latest quarter to the year-ago
+    quarter, so a business that is quietly rolling over gets caught between annual
+    reports. Returns {} if there are too few clean quarters."""
+    rev = _qseries(qinc, "Total Revenue", "Revenue")
+    ni  = _qseries(qinc, "Net Income to Common", "Net Income")
+    oi  = _qseries(qinc, "Operating Income", "EBIT")
+    fcf = _qseries(qcf, "Free Cash Flow")
+    if fcf.empty:
+        ocf, capex = _qseries(qcf, "Operating Cash Flow"), _qseries(qcf, "Capital Expenditures")
+        if len(ocf) and len(capex):
+            common = ocf.index.intersection(capex.index)
+            fcf = (ocf[common] + capex[common]).dropna()
+    if len(rev) < 4:
+        return {}
+
+    def ttm(s, back=0):
+        if len(s) < 4 + back:
+            return None
+        end = len(s) - back
+        return float(s.iloc[end - 4:end].sum())
+
+    def yoy_q(s):
+        if len(s) >= 5 and _fnum(s.iloc[-5]) and s.iloc[-5] != 0:
+            return s.iloc[-1] / abs(s.iloc[-5]) - 1 if s.iloc[-5] > 0 else None
+        return None
+
+    def g(a, b):
+        return (a / b - 1) if (_fnum(a) and _fnum(b) and b > 0) else None
+
+    sh = _qseries(qinc, "Shares Outstanding (Basic)", "Basic Shares Outstanding",
+                  "Total Common Shares Outstanding")
+    shares_true = (sh.iloc[-1] / fx) if (len(sh) and _fnum(sh.iloc[-1]) and sh.iloc[-1] > 0) else None
+
+    out = {
+        "n_quarters": len(rev),
+        "latestQ": str(rev.index[-1]),
+        "ttmRev": ttm(rev), "ttmRevPrev": ttm(rev, 4),
+        "ttmNi": ttm(ni),  "ttmNiPrev": ttm(ni, 4),
+        "ttmOi": ttm(oi),  "ttmFcf": ttm(fcf),
+        "qRevYoY": yoy_q(rev), "qNiYoY": yoy_q(ni),
+        "revSeries": rev.iloc[-8:], "niSeries": ni.iloc[-8:],
+    }
+    out["ttmRevYoY"] = g(out["ttmRev"], out["ttmRevPrev"])
+    out["ttmNiYoY"] = g(out["ttmNi"], out["ttmNiPrev"])
+    out["ttmOpMargin"] = _safe_div(out["ttmOi"], out["ttmRev"])
+    out["ttmNetMargin"] = _safe_div(out["ttmNi"], out["ttmRev"])
+    out["ttmFcfMargin"] = _safe_div(out["ttmFcf"], out["ttmRev"])
+    if shares_true and _fnum(out["ttmNi"]):
+        out["ttmEps"] = out["ttmNi"] / shares_true
+    out["momentum"] = _momentum_read(out)
+    return out
+
+
+def _momentum_read(m):
+    qr, qn = m.get("qRevYoY"), m.get("qNiYoY")
+    tr, tn = m.get("ttmRevYoY"), m.get("ttmNiYoY")
+    if _fnum(qr) and qr < -0.01 and _fnum(tr) and tr > 0:
+        return ("caution", "The latest quarter's revenue is DOWN year-on-year even "
+                "though the trailing year is still up - momentum may be rolling over.")
+    if _fnum(qn) and qn < -0.02 and _fnum(tn) and tn >= 0:
+        return ("caution", "Latest-quarter earnings fell year-on-year while the "
+                "trailing year held up - watch the next print.")
+    if _fnum(qr) and _fnum(tr) and qr > tr + 0.03 and tr > 0:
+        return ("good", "Growth is accelerating - the latest quarter is running ahead "
+                "of the trailing-year pace.")
+    if _fnum(tr) and tr > 0.02:
+        return ("good", "Steady growth - the trailing twelve months are ahead of the "
+                "year before.")
+    if _fnum(tr) and tr < -0.02:
+        return ("bad", "The trailing twelve months are below the year before - on "
+                "current data the business is shrinking.")
+    return ("neutral", "Roughly flat, or too few clean quarters to call it.")
+
+
+def render_momentum(ticker, currency):
+    """Momentum tab: quarterly trend and trailing-twelve-month figures, so the read
+    isn't months out of date between annual reports."""
+    st.subheader("Momentum - latest quarter & trailing twelve months")
+    st.caption("Annual statements can be six months stale. This uses the quarterly "
+               "feed to show the trailing twelve months (TTM) and whether the trend "
+               "is accelerating or rolling over.")
+    qinc, _, _ = get_quarterly(ticker, "Income Statement")
+    qbal, _, _ = get_quarterly(ticker, "Balance Sheet")
+    qcf, _, _ = get_quarterly(ticker, "Cash Flow")
+    fx = (_FX_CONTEXT.get(ticker, {}) or {}).get("rate") or 1.0
+    m = quarterly_momentum(qinc, qbal, qcf, fx)
+    if not m:
+        st.info("Quarterly data isn't available for this company from the source, so "
+                "a momentum read can't be built. The annual view still applies.")
+        return
+
+    cur = currency or "JMD"
+
+    def pct(x):
+        return "-" if not _fnum(x) else f"{x*100:+.0f}%"
+
+    def pctm(x):
+        return "-" if not _fnum(x) else f"{x*100:.1f}%"
+
+    def money(x):
+        return "-" if not _fnum(x) else fmt_money_compact(x, cur)
+
+    kind, txt = m["momentum"]
+    col = {"good": "#1a7f37", "caution": "#9a6700", "bad": "#cf222e",
+           "neutral": "#57606a"}.get(kind, "#57606a")
+    bg = {"good": "#dafbe1", "caution": "#fff8c5", "bad": "#ffebe9",
+          "neutral": "#eaeef2"}.get(kind, "#eaeef2")
+    st.markdown("<div style='margin:8px 0;padding:12px 16px;border-radius:10px;"
+                "background:" + bg + ";border:1px solid " + col + "44'>"
+                "<b style='color:" + col + "'>Momentum: " + txt + "</b></div>",
+                unsafe_allow_html=True)
+    st.caption(f"Most recent quarter on file: {m['latestQ']} "
+               f"({m['n_quarters']} quarters available).")
+
+    c = st.columns(4)
+    c[0].metric("TTM revenue", money(m.get("ttmRev")), pct(m.get("ttmRevYoY")),
+                help="Trailing twelve months vs the twelve months before.")
+    c[1].metric("TTM net income", money(m.get("ttmNi")), pct(m.get("ttmNiYoY")))
+    c[2].metric("Latest-Q revenue YoY", pct(m.get("qRevYoY")))
+    c[3].metric("Latest-Q earnings YoY", pct(m.get("qNiYoY")))
+    c = st.columns(4)
+    c[0].metric("TTM operating margin", pctm(m.get("ttmOpMargin")))
+    c[1].metric("TTM net margin", pctm(m.get("ttmNetMargin")))
+    c[2].metric("TTM FCF margin", pctm(m.get("ttmFcfMargin")))
+    if _fnum(m.get("ttmEps")):
+        c[3].metric("TTM EPS", f"{cur} {m['ttmEps']:,.2f}")
+
+    st.divider()
+    rs, ns = m.get("revSeries"), m.get("niSeries")
+    cc = st.columns(2)
+    if rs is not None and len(rs):
+        with cc[0]:
+            st.plotly_chart(bar_chart(rs, "Quarterly revenue", cur),
+                            use_container_width=True)
+    if ns is not None and len(ns):
+        with cc[1]:
+            st.plotly_chart(bar_chart(ns, "Quarterly net income", cur),
+                            use_container_width=True)
+    st.caption("Quarterly figures are as-reported and can be seasonal; the YoY "
+               "comparisons above control for seasonality by using the same quarter "
+               "a year earlier and the full trailing year.")
+
+
 def render_valuation(income, balance, cashflow, currency, ticker,
                      discount, term_g, mos, asset_life=0, residual_pct=0.0,
                      recovery=None):
@@ -3853,7 +4036,7 @@ def main():
         )
 
     tabs = st.tabs(["Overview", "Verdict", "Income Statement", "Balance Sheet",
-                    "Cash Flow", "Decomposition", "Ratios", "Valuation"])
+                    "Cash Flow", "Decomposition", "Ratios", "Valuation", "Momentum"])
 
     # ---- Overview ---------------------------------------------------------
     with tabs[0]:
@@ -4059,6 +4242,10 @@ def main():
     with tabs[7]:
         render_valuation(income, balance, cashflow, currency, ticker,
                          discount, term_g, mos, asset_life, residual_pct, recovery)
+
+    # ---- Momentum (quarterly / TTM) --------------------------------------
+    with tabs[8]:
+        render_momentum(ticker, currency)
 
 
 if __name__ == "__main__":
